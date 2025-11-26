@@ -49,53 +49,85 @@ class MarketScanner:
         except Exception as e:
             logger.error(f"Error in market scan: {e}", exc_info=True)
     
-    def _process_market(self, market: dict) -> dict:
+    def _process_market(self, market: dict) -> Optional[dict]:
         """Process raw market data into our schema"""
-        # Extract condition_id (could be in different places)
-        condition_id = (
-            market.get('condition_id') or 
-            market.get('id') or 
-            market.get('event', {}).get('condition_id')
-        )
-        
-        if not condition_id:
+        try:
+            # Extract condition_id (try multiple possible fields)
+            condition_id = (
+                market.get('conditionId') or
+                market.get('condition_id') or 
+                market.get('id') or 
+                market.get('event', {}).get('conditionId') or
+                market.get('event', {}).get('condition_id')
+            )
+            
+            if not condition_id:
+                logger.warning(f"Market missing condition_id: {market.keys()}")
+                return None
+            
+            # Extract question
+            question = (
+                market.get('question') or 
+                market.get('title') or
+                market.get('event', {}).get('question', '') or
+                market.get('name', '')
+            )
+            
+            if not question:
+                question = f"Market {condition_id}"
+            
+            # Extract slug
+            slug = (
+                market.get('slug') or 
+                market.get('event', {}).get('slug') or
+                market.get('id') or
+                condition_id
+            )
+            
+            # Extract volume and liquidity (try multiple field names)
+            volume_24h = float(
+                market.get('volume24hr') or
+                market.get('volume_24h') or
+                market.get('volume24h') or
+                market.get('volume') or
+                market.get('volumeUSD') or
+                0
+            )
+            
+            liquidity = float(
+                market.get('liquidity') or
+                market.get('liquidityUSD') or
+                market.get('totalLiquidity') or
+                0
+            )
+            
+            # Extract end date (try multiple formats)
+            end_date = (
+                market.get('endDate') or
+                market.get('end_date') or
+                market.get('end_date_iso') or
+                market.get('endDateISO') or
+                market.get('event', {}).get('endDate') or
+                market.get('event', {}).get('end_date_iso')
+            )
+            
+            # Extract additional useful data
+            tokens = market.get('tokens') or market.get('tokenIds') or []
+            outcomes = market.get('outcomes') or []
+            
+            return {
+                'condition_id': str(condition_id),
+                'question': str(question),
+                'slug': str(slug),
+                'url': f"https://polymarket.com/event/{slug}",
+                'end_date': end_date,
+                'volume_24h': volume_24h,
+                'liquidity': liquidity,
+                'raw_data': market
+            }
+        except Exception as e:
+            logger.error(f"Error processing market: {e}", exc_info=True)
             return None
-        
-        # Extract question
-        question = (
-            market.get('question') or 
-            market.get('title') or
-            market.get('event', {}).get('question', '')
-        )
-        
-        # Extract slug
-        slug = (
-            market.get('slug') or 
-            market.get('event', {}).get('slug') or
-            condition_id
-        )
-        
-        # Extract volume and liquidity
-        volume_24h = float(market.get('volume', 0) or 0)
-        liquidity = float(market.get('liquidity', 0) or 0)
-        
-        # Extract end date
-        end_date = (
-            market.get('end_date_iso') or 
-            market.get('endDate') or
-            market.get('event', {}).get('end_date_iso')
-        )
-        
-        return {
-            'condition_id': condition_id,
-            'question': question,
-            'slug': slug,
-            'url': f"https://polymarket.com/event/{slug}",
-            'end_date': end_date,
-            'volume_24h': volume_24h,
-            'liquidity': liquidity,
-            'raw_data': market
-        }
     
     def run(self):
         """Main worker loop"""

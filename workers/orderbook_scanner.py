@@ -34,6 +34,7 @@ class OrderBookScanner:
             logger.info(f"Scanning order books for {len(markets)} markets")
             
             scanned_count = 0
+            
             for market in markets:
                 try:
                     condition_id = market.get('condition_id')
@@ -43,7 +44,7 @@ class OrderBookScanner:
                     # Get tokens for this market
                     tokens = self.api.get_market_tokens(condition_id)
                     if not tokens:
-                        # Try to get from raw_data
+                        # Try to extract from raw_data
                         raw_data = market.get('raw_data', {})
                         tokens = self._extract_tokens(raw_data)
                     
@@ -51,7 +52,7 @@ class OrderBookScanner:
                         logger.debug(f"No tokens found for market {condition_id}")
                         continue
                     
-                    # Fetch order book for first token (YES outcome typically)
+                    # Fetch order book for first token (typically YES outcome)
                     orderbook = self.api.get_orderbook(tokens[0])
                     if orderbook:
                         bids = orderbook.get('bids', [])
@@ -77,20 +78,34 @@ class OrderBookScanner:
         """Extract token IDs from raw market data"""
         tokens = []
         
-        # Try different possible structures
-        if 'tokens' in raw_data:
+        if not isinstance(raw_data, dict):
+            return tokens
+        
+        # Try different possible structures for tokens
+        if 'tokens' in raw_data and isinstance(raw_data['tokens'], list):
             for token in raw_data['tokens']:
-                if isinstance(token, dict) and 'token_id' in token:
-                    tokens.append(token['token_id'])
+                if isinstance(token, dict):
+                    token_id = token.get('token_id') or token.get('id') or token.get('address')
+                    if token_id:
+                        tokens.append(str(token_id))
                 elif isinstance(token, str):
                     tokens.append(token)
         
-        if 'outcomes' in raw_data:
+        # Also check 'outcomes' array if present
+        if 'outcomes' in raw_data and isinstance(raw_data['outcomes'], list):
             for outcome in raw_data['outcomes']:
-                if isinstance(outcome, dict) and 'token_id' in outcome:
-                    tokens.append(outcome['token_id'])
+                if isinstance(outcome, dict):
+                    token_id = outcome.get('token_id') or outcome.get('id')
+                    if token_id:
+                        tokens.append(str(token_id))
         
-        return tokens
+        # Check tokenIds array
+        if 'tokenIds' in raw_data and isinstance(raw_data['tokenIds'], list):
+            for token_id in raw_data['tokenIds']:
+                if token_id:
+                    tokens.append(str(token_id))
+        
+        return list(set(tokens))  # Return unique tokens
     
     def run(self):
         """Main worker loop"""

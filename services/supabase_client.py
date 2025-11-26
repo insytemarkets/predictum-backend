@@ -33,15 +33,19 @@ class SupabaseClient:
                 logger.warning("Market missing condition_id")
                 return None
             
+            # Ensure proper data types
+            volume_24h = float(market_data.get('volume_24h', 0) or 0)
+            liquidity = float(market_data.get('liquidity', 0) or 0)
+            
             data = {
-                'condition_id': condition_id,
-                'question': market_data.get('question', ''),
-                'slug': market_data.get('slug', condition_id),
-                'url': market_data.get('url', f"https://polymarket.com/event/{condition_id}"),
-                'end_date': market_data.get('end_date_iso'),
-                'volume_24h': market_data.get('volume', 0),
-                'liquidity': market_data.get('liquidity', 0),
-                'raw_data': market_data
+                'condition_id': str(condition_id),
+                'question': str(market_data.get('question', '')),
+                'slug': str(market_data.get('slug', condition_id)),
+                'url': str(market_data.get('url', f"https://polymarket.com/event/{condition_id}")),
+                'end_date': market_data.get('end_date'),
+                'volume_24h': volume_24h,
+                'liquidity': liquidity,
+                'raw_data': market_data.get('raw_data', market_data)
             }
             
             result = self.client.table('markets').upsert(
@@ -53,7 +57,7 @@ class SupabaseClient:
                 return result.data[0] if isinstance(result.data, list) else result.data
             return None
         except Exception as e:
-            logger.error(f"Error upserting market: {e}")
+            logger.error(f"Error upserting market: {e}", exc_info=True)
             return None
     
     def insert_orderbook(self, market_id: str, bids: List[Dict], asks: List[Dict]) -> Optional[Dict]:
@@ -105,32 +109,39 @@ class SupabaseClient:
         try:
             market_id = opportunity_data.get('market_id')
             if not market_id:
+                logger.warning("Opportunity missing market_id")
                 return None
             
             # Get market UUID
             market = self.client.table('markets').select('id').eq('condition_id', market_id).execute()
             if not market.data or len(market.data) == 0:
+                logger.warning(f"Market not found for opportunity: {market_id}")
                 return None
             
             market_uuid = market.data[0]['id']
             
+            # Ensure proper data types
+            profit_potential = float(opportunity_data.get('profit_potential', 0) or 0)
+            confidence_score = float(opportunity_data.get('confidence_score', 0) or 0)
+            
             data = {
                 'market_id': market_uuid,
-                'type': opportunity_data.get('type', 'spread'),
-                'profit_potential': opportunity_data.get('profit_potential', 0),
-                'confidence_score': opportunity_data.get('confidence_score', 0),
+                'type': str(opportunity_data.get('type', 'spread')),
+                'profit_potential': profit_potential,
+                'confidence_score': confidence_score,
                 'details': opportunity_data.get('details', {}),
-                'status': opportunity_data.get('status', 'active')
+                'status': str(opportunity_data.get('status', 'active'))
             }
             
+            # Use upsert with conflict on market_id + type (unique combination)
             result = self.client.table('opportunities').upsert(
                 data,
-                on_conflict='id'
+                on_conflict='market_id,type'
             ).execute()
             
             return result.data[0] if result.data else None
         except Exception as e:
-            logger.error(f"Error upserting opportunity: {e}")
+            logger.error(f"Error upserting opportunity: {e}", exc_info=True)
             return None
     
     def upsert_market_stats(self, market_id: str, stats: Dict) -> Optional[Dict]:

@@ -55,14 +55,36 @@ class PolymarketAPI:
         Fetch markets from GAMMA API
         Returns list of market events
         """
+        # Polymarket GAMMA API uses /events endpoint
+        # Try different parameter formats
         params = {
             'limit': limit,
             'active': str(active).lower(),
-            'closed': str(closed).lower()
+            'closed': str(closed).lower(),
+            'sort': 'volume',
+            'order': 'desc'
         }
+        
         data = self._get_gamma('/events', params)
+        
+        if data:
+            if isinstance(data, list):
+                return data
+            # Sometimes API returns dict with 'data' key
+            if isinstance(data, dict):
+                if 'data' in data:
+                    return data['data'] if isinstance(data['data'], list) else []
+                if 'events' in data:
+                    return data['events'] if isinstance(data['events'], list) else []
+                if 'results' in data:
+                    return data['results'] if isinstance(data['results'], list) else []
+        
+        # Fallback: try without params
+        logger.warning("Failed to fetch with params, trying without...")
+        data = self._get_gamma('/events')
         if data and isinstance(data, list):
-            return data
+            return data[:limit]
+        
         return []
     
     def get_market_by_slug(self, slug: str) -> Optional[Dict]:
@@ -78,7 +100,26 @@ class PolymarketAPI:
         Get order book for a token from CLOB API
         Returns bids and asks
         """
-        return self._get_clob(f'/book', params={'token': token_id})
+        # CLOB API uses /book endpoint
+        # Try different parameter formats
+        params = {'token': token_id}
+        data = self._get_clob('/book', params=params)
+        
+        if data:
+            if isinstance(data, dict):
+                # Standard format: {'bids': [...], 'asks': [...]}
+                if 'bids' in data and 'asks' in data:
+                    return data
+                # Alternative format: {'data': {'bids': [...], 'asks': [...]}}
+                if 'data' in data and isinstance(data['data'], dict):
+                    return data['data']
+        
+        # Try alternative endpoint format
+        data = self._get_clob(f'/book/{token_id}')
+        if data and isinstance(data, dict):
+            return data
+        
+        return None
     
     def get_trades(self, token_id: str, limit: int = 100) -> List[Dict]:
         """Get recent trades for a token"""
@@ -92,13 +133,63 @@ class PolymarketAPI:
         Get token IDs for a market condition
         Returns list of token addresses for YES/NO outcomes
         """
-        # This might need to be constructed from market data
-        # For now, we'll extract from market data structure
+        # Try to get market details
         market = self.get_market_by_slug(condition_id)
+        if not market:
+            # Try with condition_id directly
+            market = self._get_gamma(f'/events/{condition_id}')
+        
         if not market:
             return None
         
         tokens = []
-        if 'tokens' in market:
-            tokens = [token.get('token_id') for token in market['tokens'] if token.get('token_id')]
+        # Extract tokens from various possible structures
+        if isinstance(market, dict):
+            # Check for tokens array
+            if 'tokens' in market:
+                for token in market['tokens']:
+                    if isinstance(token, dict):
+                        token_id = token.get('token_id') or token.get('id') or token.get('address')
+                        if token_id:
+                            tokens.append(token_id)
+                    elif isinstance(token, str):
+                        tokens.append(token)
+            
+            # Check for outcomes array
+            if 'outcomes' in market:
+                for outcome in market['outcomes']:
+                    if isinstance(outcome, dict):
+                        token_id = outcome.get('token_id') or outcome.get('id') or outcome.get('address')
+                        if token_id:
+                            tokens.append(token_id)
+            
+            # Check raw_data if present
+            if 'raw_data' in market and isinstance(market['raw_data'], dict):
+                raw = market['raw_data']
+                if 'tokens' in raw:
+                    for token in raw['tokens']:
+                        if isinstance(token, dict):
+                            token_id = token.get('token_id') or token.get('id')
+                            if token_id:
+                                tokens.append(token_id)
+        
         return tokens if tokens else None
+    
+    def get_market_details(self, condition_id: str) -> Optional[Dict]:
+        """Get full market details including tokens and prices"""
+        market = self.get_market_by_slug(condition_id)
+        if not market:
+            market = self._get_gamma(f'/events/{condition_id}')
+        
+        if market:
+            # Get prices
+            prices = self.get_market_prices(condition_id)
+            if prices:
+                market['prices'] = prices
+            
+            # Get tokens
+            tokens = self.get_market_tokens(condition_id)
+            if tokens:
+                market['token_ids'] = tokens
+        
+        return market

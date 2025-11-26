@@ -33,10 +33,22 @@ class PolymarketAPI:
         url = f"{self.gamma_base}{endpoint}"
         try:
             response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 422:
+                # 422 means invalid params - log but don't error
+                logger.debug(f"GAMMA API 422 for {endpoint} with params {params} - returning None")
+                return None
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            # Log if we get empty/null response
+            if not data:
+                logger.warning(f"GAMMA API returned empty response for {endpoint}")
+            elif isinstance(data, dict) and not any(k in data for k in ['data', 'events', 'results']):
+                logger.debug(f"GAMMA API response structure for {endpoint}: {list(data.keys())[:5]}")
+            return data
         except requests.exceptions.RequestException as e:
             logger.error(f"GAMMA API error ({endpoint}): {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response status: {e.response.status_code}, body: {e.response.text[:200]}")
             return None
     
     def _get_clob(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:

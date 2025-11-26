@@ -4,7 +4,7 @@ Fetches markets from Polymarket GAMMA API and stores in Supabase
 """
 import time
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict
 from services.polymarket_api import PolymarketAPI
 from services.supabase_client import SupabaseClient
 
@@ -40,24 +40,33 @@ class MarketScanner:
                     # Transform market data
                     processed = self._process_market(market)
                     if processed:
-                        # Extract and store token IDs
                         condition_id = processed.get('condition_id')
                         if condition_id:
-                            tokens = self.api.get_market_tokens(condition_id)
+                            # Extract tokens directly from market data first
+                            tokens = self._extract_tokens_from_market(market)
+                            
+                            # If not found, try API call
+                            if not tokens:
+                                tokens = self.api.get_market_tokens(condition_id)
+                            
                             if tokens:
                                 processed['tokens'] = tokens
                                 all_token_ids.extend(tokens)
-                        
-                        result = self.db.upsert_market(processed)
-                        if result:
-                            stored_count += 1
+                                
+                                # Store tokens in raw_data for later use
+                                if isinstance(processed.get('raw_data'), dict):
+                                    processed['raw_data']['stored_tokens'] = tokens
                             
-                            # Fetch and store initial prices for tokens
-                            if tokens:
-                                self._fetch_and_store_prices(condition_id, tokens)
+                            result = self.db.upsert_market(processed)
+                            if result:
+                                stored_count += 1
+                                
+                                # Fetch and store initial prices for tokens
+                                if tokens:
+                                    self._fetch_and_store_prices(condition_id, tokens)
                             
                 except Exception as e:
-                    logger.error(f"Error processing market {market.get('id', 'unknown')}: {e}")
+                    logger.error(f"Error processing market {market.get('id', 'unknown')}: {e}", exc_info=True)
                     continue
             
             logger.info(f"Stored {stored_count} markets with {len(set(all_token_ids))} unique tokens")
@@ -65,9 +74,71 @@ class MarketScanner:
         except Exception as e:
             logger.error(f"Error in market scan: {e}", exc_info=True)
     
+    def _extract_tokens_from_market(self, market: dict) -> List[str]:
+        """Extract token IDs directly from market data structure"""
+        tokens = []
+        
+        if not isinstance(market, dict):
+            return tokens
+        
+        # Check for tokens array in various locations
+        if 'tokens' in market and isinstance(market['tokens'], list):
+            for token in market['tokens']:
+                if isinstance(token, dict):
+                    # Try various token ID fields
+                    token_id = (
+                        token.get('token_id') or 
+                        token.get('tokenId') or
+                        token.get('id') or 
+                        token.get('address') or
+                        token.get('asset_id') or
+                        token.get('assetId')
+                    )
+                    if token_id:
+                        tokens.append(str(token_id))
+                elif isinstance(token, str):
+                    tokens.append(token)
+        
+        # Check outcomes array
+        if 'outcomes' in market and isinstance(market['outcomes'], list):
+            for outcome in market['outcomes']:
+                if isinstance(outcome, dict):
+                    token_id = (
+                        outcome.get('token_id') or 
+                        outcome.get('tokenId') or
+                        outcome.get('id') or 
+                        outcome.get('address') or
+                        outcome.get('asset_id')
+                    )
+                    if token_id:
+                        tokens.append(str(token_id))
+        
+        # Check tokenIds array
+        if 'tokenIds' in market and isinstance(market['tokenIds'], list):
+            for token_id in market['tokenIds']:
+                if token_id:
+                    tokens.append(str(token_id))
+        
+        # Check event nested structure
+        if 'event' in market and isinstance(market['event'], dict):
+            event = market['event']
+            if 'tokens' in event:
+                for token in event['tokens']:
+                    if isinstance(token, dict):
+                        token_id = token.get('token_id') or token.get('id')
+                        if token_id:
+                            tokens.append(str(token_id))
+                    elif isinstance(token, str):
+                        tokens.append(token)
+        
+        return list(set(tokens))  # Remove duplicates
+    
     def _fetch_and_store_prices(self, condition_id: str, tokens: List[str]):
         """Fetch current prices for tokens and store in prices table"""
         try:
+            if not tokens:
+                return
+                
             # Fetch prices in batch
             prices = self.api.get_prices_batch(tokens)
             
@@ -79,7 +150,7 @@ class MarketScanner:
                         self.db.insert_price(condition_id, idx, price)
             
         except Exception as e:
-            logger.error(f"Error fetching/storing prices for {condition_id}: {e}")
+            logger.error(f"Error fetching/storing prices for {condition_id}: {e}", exc_info=True)
     
     def _process_market(self, market: dict) -> Optional[dict]:
         """Process raw market data into our schema"""

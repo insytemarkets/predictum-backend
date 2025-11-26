@@ -54,36 +54,33 @@ class PolymarketAPI:
         """
         Fetch markets from GAMMA API
         Returns list of market events
+        GAMMA API /events endpoint doesn't accept those params - returns 422
         """
-        # Polymarket GAMMA API uses /events endpoint
-        # Try different parameter formats
-        params = {
-            'limit': limit,
-            'active': str(active).lower(),
-            'closed': str(closed).lower(),
-            'sort': 'volume',
-            'order': 'desc'
-        }
-        
-        data = self._get_gamma('/events', params)
+        # GAMMA API /events returns all events, we'll filter client-side if needed
+        data = self._get_gamma('/events')
         
         if data:
             if isinstance(data, list):
-                return data
+                # Filter active markets if needed
+                if active:
+                    filtered = [m for m in data if m.get('active', True) and not m.get('closed', False)]
+                    return filtered[:limit]
+                return data[:limit]
             # Sometimes API returns dict with 'data' key
             if isinstance(data, dict):
                 if 'data' in data:
-                    return data['data'] if isinstance(data['data'], list) else []
-                if 'events' in data:
-                    return data['events'] if isinstance(data['events'], list) else []
-                if 'results' in data:
-                    return data['results'] if isinstance(data['results'], list) else []
-        
-        # Fallback: try without params
-        logger.warning("Failed to fetch with params, trying without...")
-        data = self._get_gamma('/events')
-        if data and isinstance(data, list):
-            return data[:limit]
+                    markets = data['data'] if isinstance(data['data'], list) else []
+                elif 'events' in data:
+                    markets = data['events'] if isinstance(data['events'], list) else []
+                elif 'results' in data:
+                    markets = data['results'] if isinstance(data['results'], list) else []
+                else:
+                    markets = []
+                
+                if active and markets:
+                    filtered = [m for m in markets if m.get('active', True) and not m.get('closed', False)]
+                    return filtered[:limit]
+                return markets[:limit]
         
         return []
     

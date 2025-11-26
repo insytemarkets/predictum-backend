@@ -49,9 +49,14 @@ class PriceHistoryWorker:
                 if not tokens:
                     # Try to extract from raw_data
                     raw_data = market.get('raw_data', {})
-                    if 'tokens' in raw_data:
-                        tokens = raw_data['tokens']
-                    else:
+                    if isinstance(raw_data, dict):
+                        # Check for clobTokenIds first (GAMMA API format)
+                        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
+                            tokens = [str(t) for t in raw_data['clobTokenIds'] if t]
+                        elif 'tokens' in raw_data:
+                            tokens = raw_data['tokens']
+                    
+                    if not tokens:
                         tokens = self.api.get_market_tokens(condition_id)
                 
                 if tokens:

@@ -65,60 +65,91 @@ class PolymarketAPI:
     
     def get_markets(self, limit: int = 100, active: bool = True, closed: bool = False) -> List[Dict]:
         """
-        Fetch markets from Polymarket API
-        Tries multiple endpoints: /events, /markets, data-api
+        Fetch markets from Polymarket GAMMA API
+        GAMMA API returns EVENTS which contain MARKETS
+        Structure: Event -> markets[] -> each market has conditionId and clobTokenIds
         """
-        # Try GAMMA API /events endpoint first
+        # Try GAMMA API /events endpoint
         data = self._get_gamma('/events')
         
-        if data:
-            if isinstance(data, list):
-                # Filter active markets if needed
-                if active:
-                    filtered = [m for m in data if m.get('active', True) and not m.get('closed', False)]
-                    return filtered[:limit]
-                return data[:limit]
-            # Sometimes API returns dict with 'data' key
-            if isinstance(data, dict):
-                if 'data' in data:
-                    markets = data['data'] if isinstance(data['data'], list) else []
-                elif 'events' in data:
-                    markets = data['events'] if isinstance(data['events'], list) else []
-                elif 'results' in data:
-                    markets = data['results'] if isinstance(data['results'], list) else []
-                else:
-                    markets = []
-                
-                if active and markets:
-                    filtered = [m for m in markets if m.get('active', True) and not m.get('closed', False)]
-                    return filtered[:limit]
-                return markets[:limit]
+        if not data:
+            logger.warning("GAMMA API /events returned no data")
+            return []
         
-        # Fallback: Try /markets endpoint
-        logger.info("Trying /markets endpoint as fallback...")
-        data = self._get_gamma('/markets')
-        if data:
-            if isinstance(data, list):
-                return data[:limit]
-            if isinstance(data, dict) and 'data' in data:
-                return data['data'][:limit] if isinstance(data['data'], list) else []
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            # Extract from common wrapper keys
+            events = data.get('data') or data.get('events') or data.get('results') or []
         
-        # Fallback: Try data-api endpoint
-        logger.info("Trying data-api endpoint as fallback...")
-        try:
-            rate_limiter.wait_gamma()  # Use same rate limiter
-            response = self.session.get(f"{self.data_api_base}/markets", timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list):
-                    return data[:limit]
-                if isinstance(data, dict) and 'data' in data:
-                    return data['data'][:limit] if isinstance(data['data'], list) else []
-        except Exception as e:
-            logger.error(f"Data-API error: {e}")
+        if not events:
+            logger.warning("No events found in GAMMA API response")
+            return []
         
-        logger.warning("All market endpoints returned no data")
-        return []
+        logger.info(f"GAMMA API returned {len(events)} events")
+        
+        # Filter events by active/closed status
+        if active:
+            events = [e for e in events if e.get('active', True) and not e.get('closed', False)]
+        
+        logger.info(f"After filtering: {len(events)} active events")
+        
+        # Extract individual markets from events
+        # Each event can have multiple markets in its 'markets' array
+        all_markets = []
+        for event in events:
+            event_markets = event.get('markets', [])
+            
+            if event_markets:
+                for market in event_markets:
+                    if isinstance(market, dict):
+                        # Flatten: copy event-level data to market
+                        market_data = {
+                            'conditionId': market.get('conditionId') or market.get('condition_id'),
+                            'question': market.get('question') or event.get('title', ''),
+                            'slug': market.get('slug') or event.get('slug', ''),
+                            'volume': market.get('volumeNum') or market.get('volume') or event.get('volume', 0),
+                            'volume24hr': market.get('volume24hr') or event.get('volume24hr', 0),
+                            'liquidity': market.get('liquidityNum') or market.get('liquidity') or event.get('liquidity', 0),
+                            'endDate': market.get('endDate') or event.get('endDate'),
+                            'active': market.get('active', True),
+                            'closed': market.get('closed', False),
+                            'category': market.get('category') or event.get('category', ''),
+                            # IMPORTANT: Extract token IDs from market
+                            'clobTokenIds': market.get('clobTokenIds', []),
+                            'outcomes': market.get('outcomes', []),
+                            'outcomePrices': market.get('outcomePrices', []),
+                            # Store raw data for later use
+                            'raw_data': market
+                        }
+                        all_markets.append(market_data)
+            else:
+                # Event itself might be a single market (legacy format)
+                if event.get('conditionId') or event.get('condition_id'):
+                    market_data = {
+                        'conditionId': event.get('conditionId') or event.get('condition_id'),
+                        'question': event.get('title') or event.get('question', ''),
+                        'slug': event.get('slug', ''),
+                        'volume': event.get('volume', 0),
+                        'volume24hr': event.get('volume24hr', 0),
+                        'liquidity': event.get('liquidity', 0),
+                        'endDate': event.get('endDate'),
+                        'active': event.get('active', True),
+                        'closed': event.get('closed', False),
+                        'category': event.get('category', ''),
+                        'clobTokenIds': event.get('clobTokenIds', []),
+                        'outcomes': event.get('outcomes', []),
+                        'outcomePrices': event.get('outcomePrices', []),
+                        'raw_data': event
+                    }
+                    all_markets.append(market_data)
+        
+        logger.info(f"Extracted {len(all_markets)} individual markets from events")
+        
+        # Sort by volume and return limited results
+        all_markets.sort(key=lambda x: float(x.get('volume24hr') or x.get('volume') or 0), reverse=True)
+        return all_markets[:limit]
     
     def get_market_by_slug(self, slug: str) -> Optional[Dict]:
         """Get a specific market by slug"""

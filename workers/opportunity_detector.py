@@ -48,11 +48,16 @@ class OpportunityDetector:
                 if not tokens:
                     # Try extracting from raw_data
                     raw_data = market.get('raw_data', {})
-                    if 'stored_tokens' in raw_data:
-                        tokens = raw_data['stored_tokens']
-                    elif 'tokens' in raw_data:
-                        tokens = raw_data['tokens']
-                    else:
+                    if isinstance(raw_data, dict):
+                        # Check for clobTokenIds first (GAMMA API format)
+                        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
+                            tokens = [str(t) for t in raw_data['clobTokenIds'] if t]
+                        elif 'stored_tokens' in raw_data:
+                            tokens = raw_data['stored_tokens']
+                        elif 'tokens' in raw_data:
+                            tokens = raw_data['tokens']
+                    
+                    if not tokens:
                         tokens = self.api.get_market_tokens(condition_id)
                 
                 if tokens and len(tokens) >= 2:

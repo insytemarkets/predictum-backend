@@ -48,7 +48,10 @@ class OrderBookScanner:
                     # Try to extract from raw_data
                     raw_data = market.get('raw_data', {})
                     if isinstance(raw_data, dict):
-                        if 'stored_tokens' in raw_data:
+                        # Check for clobTokenIds first (GAMMA API format)
+                        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
+                            tokens = [str(t) for t in raw_data['clobTokenIds'] if t]
+                        elif 'stored_tokens' in raw_data:
                             tokens = raw_data['stored_tokens']
                         elif 'tokens' in raw_data:
                             tokens = raw_data['tokens']
@@ -124,6 +127,14 @@ class OrderBookScanner:
         
         if not isinstance(raw_data, dict):
             return tokens
+        
+        # PRIORITY: Check for clobTokenIds (GAMMA API format)
+        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
+            for token_id in raw_data['clobTokenIds']:
+                if token_id:
+                    tokens.append(str(token_id))
+            if tokens:
+                return list(set(tokens))
         
         # Try different possible structures for tokens
         if 'tokens' in raw_data and isinstance(raw_data['tokens'], list):

@@ -81,6 +81,26 @@ class MarketScanner:
         if not isinstance(market, dict):
             return tokens
         
+        # PRIORITY: Check for clobTokenIds (GAMMA API format)
+        # This is the primary field for token IDs in the GAMMA API response
+        if 'clobTokenIds' in market and isinstance(market['clobTokenIds'], list):
+            for token_id in market['clobTokenIds']:
+                if token_id:
+                    tokens.append(str(token_id))
+            if tokens:
+                logger.debug(f"Found {len(tokens)} tokens in clobTokenIds")
+                return list(set(tokens))
+        
+        # Also check raw_data for clobTokenIds
+        raw_data = market.get('raw_data', {})
+        if isinstance(raw_data, dict) and 'clobTokenIds' in raw_data:
+            for token_id in raw_data['clobTokenIds']:
+                if token_id:
+                    tokens.append(str(token_id))
+            if tokens:
+                logger.debug(f"Found {len(tokens)} tokens in raw_data.clobTokenIds")
+                return list(set(tokens))
+        
         # Check for tokens array in various locations
         if 'tokens' in market and isinstance(market['tokens'], list):
             for token in market['tokens']:

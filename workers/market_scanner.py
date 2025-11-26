@@ -76,17 +76,30 @@ class MarketScanner:
     
     def _extract_tokens_from_market(self, market: dict) -> List[str]:
         """Extract token IDs directly from market data structure"""
+        import json
         tokens = []
         
         if not isinstance(market, dict):
             return tokens
         
+        def parse_token_ids(clob_ids):
+            """Parse clobTokenIds which can be a list or a JSON string"""
+            if isinstance(clob_ids, list):
+                return [str(t) for t in clob_ids if t]
+            elif isinstance(clob_ids, str):
+                # It might be a JSON string like "[\"token1\", \"token2\"]"
+                try:
+                    parsed = json.loads(clob_ids)
+                    if isinstance(parsed, list):
+                        return [str(t) for t in parsed if t]
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return []
+        
         # PRIORITY: Check for clobTokenIds (GAMMA API format)
         # This is the primary field for token IDs in the GAMMA API response
-        if 'clobTokenIds' in market and isinstance(market['clobTokenIds'], list):
-            for token_id in market['clobTokenIds']:
-                if token_id:
-                    tokens.append(str(token_id))
+        if 'clobTokenIds' in market:
+            tokens = parse_token_ids(market['clobTokenIds'])
             if tokens:
                 logger.debug(f"Found {len(tokens)} tokens in clobTokenIds")
                 return list(set(tokens))
@@ -94,9 +107,7 @@ class MarketScanner:
         # Also check raw_data for clobTokenIds
         raw_data = market.get('raw_data', {})
         if isinstance(raw_data, dict) and 'clobTokenIds' in raw_data:
-            for token_id in raw_data['clobTokenIds']:
-                if token_id:
-                    tokens.append(str(token_id))
+            tokens = parse_token_ids(raw_data['clobTokenIds'])
             if tokens:
                 logger.debug(f"Found {len(tokens)} tokens in raw_data.clobTokenIds")
                 return list(set(tokens))

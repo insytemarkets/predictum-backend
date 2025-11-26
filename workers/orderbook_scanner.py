@@ -48,15 +48,10 @@ class OrderBookScanner:
                     # Try to extract from raw_data
                     raw_data = market.get('raw_data', {})
                     if isinstance(raw_data, dict):
-                        # Check for clobTokenIds first (GAMMA API format)
-                        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
-                            tokens = [str(t) for t in raw_data['clobTokenIds'] if t]
-                        elif 'stored_tokens' in raw_data:
+                        # Check for clobTokenIds first (GAMMA API format) - can be list or JSON string
+                        tokens = self._extract_tokens(raw_data)
+                        if not tokens and 'stored_tokens' in raw_data:
                             tokens = raw_data['stored_tokens']
-                        elif 'tokens' in raw_data:
-                            tokens = raw_data['tokens']
-                        else:
-                            tokens = self._extract_tokens(raw_data)
                     # Fallback to API call
                     if not tokens:
                         tokens = self.api.get_market_tokens(condition_id)
@@ -123,16 +118,28 @@ class OrderBookScanner:
     
     def _extract_tokens(self, raw_data: dict) -> list:
         """Extract token IDs from raw market data"""
+        import json
         tokens = []
         
         if not isinstance(raw_data, dict):
             return tokens
         
+        def parse_clob_token_ids(clob_ids):
+            """Parse clobTokenIds which can be a list or a JSON string"""
+            if isinstance(clob_ids, list):
+                return [str(t) for t in clob_ids if t]
+            elif isinstance(clob_ids, str):
+                try:
+                    parsed = json.loads(clob_ids)
+                    if isinstance(parsed, list):
+                        return [str(t) for t in parsed if t]
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return []
+        
         # PRIORITY: Check for clobTokenIds (GAMMA API format)
-        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
-            for token_id in raw_data['clobTokenIds']:
-                if token_id:
-                    tokens.append(str(token_id))
+        if 'clobTokenIds' in raw_data:
+            tokens = parse_clob_token_ids(raw_data['clobTokenIds'])
             if tokens:
                 return list(set(tokens))
         

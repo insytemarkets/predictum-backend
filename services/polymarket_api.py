@@ -69,8 +69,13 @@ class PolymarketAPI:
         GAMMA API returns EVENTS which contain MARKETS
         Structure: Event -> markets[] -> each market has conditionId and clobTokenIds
         """
-        # Try GAMMA API /events endpoint
-        data = self._get_gamma('/events')
+        # Try GAMMA API /events endpoint with query params
+        # IMPORTANT: closed=false is required to get only open/active markets
+        params = {'closed': 'false' if not closed else 'true'}
+        if limit:
+            params['limit'] = limit
+        
+        data = self._get_gamma('/events', params=params)
         
         if not data:
             logger.warning("GAMMA API /events returned no data")
@@ -89,11 +94,26 @@ class PolymarketAPI:
         
         logger.info(f"GAMMA API returned {len(events)} events")
         
-        # Filter events by active/closed status
+        # Filter events by active/closed status (redundant if params work, but safe)
         if active:
             events = [e for e in events if e.get('active', True) and not e.get('closed', False)]
         
         logger.info(f"After filtering: {len(events)} active events")
+        
+        # Helper to parse JSON strings (clobTokenIds can be a JSON string)
+        import json
+        def parse_json_field(field):
+            """Parse field that might be a JSON string or already a list"""
+            if isinstance(field, list):
+                return field
+            elif isinstance(field, str):
+                try:
+                    parsed = json.loads(field)
+                    if isinstance(parsed, list):
+                        return parsed
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return []
         
         # Extract individual markets from events
         # Each event can have multiple markets in its 'markets' array
@@ -104,6 +124,9 @@ class PolymarketAPI:
             if event_markets:
                 for market in event_markets:
                     if isinstance(market, dict):
+                        # Parse clobTokenIds which might be a JSON string
+                        clob_tokens = parse_json_field(market.get('clobTokenIds', []))
+                        
                         # Flatten: copy event-level data to market
                         market_data = {
                             'conditionId': market.get('conditionId') or market.get('condition_id'),
@@ -116,17 +139,21 @@ class PolymarketAPI:
                             'active': market.get('active', True),
                             'closed': market.get('closed', False),
                             'category': market.get('category') or event.get('category', ''),
-                            # IMPORTANT: Extract token IDs from market
-                            'clobTokenIds': market.get('clobTokenIds', []),
-                            'outcomes': market.get('outcomes', []),
-                            'outcomePrices': market.get('outcomePrices', []),
+                            # IMPORTANT: Extract token IDs from market (parsed from JSON string)
+                            'clobTokenIds': clob_tokens,
+                            'outcomes': parse_json_field(market.get('outcomes', [])),
+                            'outcomePrices': parse_json_field(market.get('outcomePrices', [])),
                             # Store raw data for later use
                             'raw_data': market
                         }
                         all_markets.append(market_data)
+                        
+                        if clob_tokens:
+                            logger.debug(f"Extracted {len(clob_tokens)} tokens for market {market_data['conditionId']}")
             else:
                 # Event itself might be a single market (legacy format)
                 if event.get('conditionId') or event.get('condition_id'):
+                    clob_tokens = parse_json_field(event.get('clobTokenIds', []))
                     market_data = {
                         'conditionId': event.get('conditionId') or event.get('condition_id'),
                         'question': event.get('title') or event.get('question', ''),
@@ -138,9 +165,9 @@ class PolymarketAPI:
                         'active': event.get('active', True),
                         'closed': event.get('closed', False),
                         'category': event.get('category', ''),
-                        'clobTokenIds': event.get('clobTokenIds', []),
-                        'outcomes': event.get('outcomes', []),
-                        'outcomePrices': event.get('outcomePrices', []),
+                        'clobTokenIds': clob_tokens,
+                        'outcomes': parse_json_field(event.get('outcomes', [])),
+                        'outcomePrices': parse_json_field(event.get('outcomePrices', [])),
                         'raw_data': event
                     }
                     all_markets.append(market_data)

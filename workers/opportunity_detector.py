@@ -20,6 +20,20 @@ class OpportunityDetector:
         self.db = SupabaseClient()
         self.scan_interval = 60  # seconds
     
+    def _parse_clob_token_ids(self, clob_ids) -> List[str]:
+        """Parse clobTokenIds which can be a list or a JSON string"""
+        import json
+        if isinstance(clob_ids, list):
+            return [str(t) for t in clob_ids if t]
+        elif isinstance(clob_ids, str):
+            try:
+                parsed = json.loads(clob_ids)
+                if isinstance(parsed, list):
+                    return [str(t) for t in parsed if t]
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return []
+    
     def detect_opportunities(self):
         """Analyze markets and detect opportunities"""
         try:
@@ -49,13 +63,10 @@ class OpportunityDetector:
                     # Try extracting from raw_data
                     raw_data = market.get('raw_data', {})
                     if isinstance(raw_data, dict):
-                        # Check for clobTokenIds first (GAMMA API format)
-                        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
-                            tokens = [str(t) for t in raw_data['clobTokenIds'] if t]
-                        elif 'stored_tokens' in raw_data:
+                        # Check for clobTokenIds first (GAMMA API format) - can be list or JSON string
+                        tokens = self._parse_clob_token_ids(raw_data.get('clobTokenIds'))
+                        if not tokens and 'stored_tokens' in raw_data:
                             tokens = raw_data['stored_tokens']
-                        elif 'tokens' in raw_data:
-                            tokens = raw_data['tokens']
                     
                     if not tokens:
                         tokens = self.api.get_market_tokens(condition_id)

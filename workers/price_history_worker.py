@@ -21,6 +21,20 @@ class PriceHistoryWorker:
         self.db = SupabaseClient()
         self.scan_interval = 300  # 5 minutes
     
+    def _parse_clob_token_ids(self, clob_ids) -> list:
+        """Parse clobTokenIds which can be a list or a JSON string"""
+        import json
+        if isinstance(clob_ids, list):
+            return [str(t) for t in clob_ids if t]
+        elif isinstance(clob_ids, str):
+            try:
+                parsed = json.loads(clob_ids)
+                if isinstance(parsed, list):
+                    return [str(t) for t in parsed if t]
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return []
+    
     def update_prices(self):
         """Fetch current prices and calculate price changes"""
         try:
@@ -50,10 +64,9 @@ class PriceHistoryWorker:
                     # Try to extract from raw_data
                     raw_data = market.get('raw_data', {})
                     if isinstance(raw_data, dict):
-                        # Check for clobTokenIds first (GAMMA API format)
-                        if 'clobTokenIds' in raw_data and isinstance(raw_data['clobTokenIds'], list):
-                            tokens = [str(t) for t in raw_data['clobTokenIds'] if t]
-                        elif 'tokens' in raw_data:
+                        # Check for clobTokenIds first (GAMMA API format) - can be list or JSON string
+                        tokens = self._parse_clob_token_ids(raw_data.get('clobTokenIds'))
+                        if not tokens and 'tokens' in raw_data:
                             tokens = raw_data['tokens']
                     
                     if not tokens:

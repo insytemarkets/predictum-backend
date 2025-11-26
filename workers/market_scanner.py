@@ -4,6 +4,7 @@ Fetches markets from Polymarket GAMMA API and stores in Supabase
 """
 import time
 import logging
+from typing import Optional, List
 from services.polymarket_api import PolymarketAPI
 from services.supabase_client import SupabaseClient
 
@@ -20,7 +21,7 @@ class MarketScanner:
         self.scan_interval = 30  # seconds
     
     def scan_markets(self):
-        """Fetch and store markets"""
+        """Fetch and store markets with token IDs and initial prices"""
         try:
             logger.info("Starting market scan...")
             markets = self.api.get_markets(limit=200, active=True, closed=False)
@@ -32,22 +33,53 @@ class MarketScanner:
             logger.info(f"Fetched {len(markets)} markets")
             
             stored_count = 0
+            all_token_ids = []
+            
             for market in markets:
                 try:
                     # Transform market data
                     processed = self._process_market(market)
                     if processed:
+                        # Extract and store token IDs
+                        condition_id = processed.get('condition_id')
+                        if condition_id:
+                            tokens = self.api.get_market_tokens(condition_id)
+                            if tokens:
+                                processed['tokens'] = tokens
+                                all_token_ids.extend(tokens)
+                        
                         result = self.db.upsert_market(processed)
                         if result:
                             stored_count += 1
+                            
+                            # Fetch and store initial prices for tokens
+                            if tokens:
+                                self._fetch_and_store_prices(condition_id, tokens)
+                            
                 except Exception as e:
                     logger.error(f"Error processing market {market.get('id', 'unknown')}: {e}")
                     continue
             
-            logger.info(f"Stored {stored_count} markets")
+            logger.info(f"Stored {stored_count} markets with {len(set(all_token_ids))} unique tokens")
             
         except Exception as e:
             logger.error(f"Error in market scan: {e}", exc_info=True)
+    
+    def _fetch_and_store_prices(self, condition_id: str, tokens: List[str]):
+        """Fetch current prices for tokens and store in prices table"""
+        try:
+            # Fetch prices in batch
+            prices = self.api.get_prices_batch(tokens)
+            
+            if prices:
+                # Store prices with outcome_index (0=YES, 1=NO typically)
+                for idx, token_id in enumerate(tokens):
+                    if token_id in prices:
+                        price = prices[token_id]
+                        self.db.insert_price(condition_id, idx, price)
+            
+        except Exception as e:
+            logger.error(f"Error fetching/storing prices for {condition_id}: {e}")
     
     def _process_market(self, market: dict) -> Optional[dict]:
         """Process raw market data into our schema"""
@@ -115,7 +147,8 @@ class MarketScanner:
             tokens = market.get('tokens') or market.get('tokenIds') or []
             outcomes = market.get('outcomes') or []
             
-            return {
+            # Store tokens in raw_data for later extraction
+            market_data = {
                 'condition_id': str(condition_id),
                 'question': str(question),
                 'slug': str(slug),
@@ -125,6 +158,9 @@ class MarketScanner:
                 'liquidity': liquidity,
                 'raw_data': market
             }
+            
+            # Tokens will be added in scan_markets() after fetching
+            return market_data
         except Exception as e:
             logger.error(f"Error processing market: {e}", exc_info=True)
             return None

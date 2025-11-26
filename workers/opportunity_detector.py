@@ -34,33 +34,60 @@ class OpportunityDetector:
             
             opportunities_found = 0
             
+            # Collect all tokens for batch fetching
+            market_tokens_map = {}  # {condition_id: [tokens]}
+            all_tokens = []
+            
+            for market in markets:
+                condition_id = market.get('condition_id')
+                if not condition_id:
+                    continue
+                
+                # Get tokens for this market
+                tokens = market.get('tokens') or []
+                if not tokens:
+                    # Try extracting from raw_data
+                    raw_data = market.get('raw_data', {})
+                    if 'stored_tokens' in raw_data:
+                        tokens = raw_data['stored_tokens']
+                    elif 'tokens' in raw_data:
+                        tokens = raw_data['tokens']
+                    else:
+                        tokens = self.api.get_market_tokens(condition_id)
+                
+                if tokens and len(tokens) >= 2:
+                    market_tokens_map[condition_id] = tokens[:2]  # YES and NO
+                    all_tokens.extend(tokens[:2])
+            
+            if not all_tokens:
+                logger.warning("No tokens found for opportunity detection")
+                return
+            
+            # Batch fetch order books
+            logger.info(f"Batch fetching {len(all_tokens)} order books for opportunity detection...")
+            orderbooks_list = self.api.get_orderbooks_batch(all_tokens)
+            
+            # Map orderbooks back to markets
+            token_to_orderbook = {}
+            for idx, orderbook in enumerate(orderbooks_list):
+                if idx < len(all_tokens):
+                    token_id = all_tokens[idx]
+                    token_to_orderbook[token_id] = orderbook
+            
+            # Process each market
             for market in markets:
                 try:
                     condition_id = market.get('condition_id')
-                    if not condition_id:
+                    if not condition_id or condition_id not in market_tokens_map:
                         continue
                     
-                    # Get market details including tokens and prices
-                    market_details = self.api.get_market_details(condition_id)
-                    if not market_details:
-                        continue
+                    tokens = market_tokens_map[condition_id]
                     
-                    # Get tokens for this market
-                    tokens = self.api.get_market_tokens(condition_id)
-                    if not tokens or len(tokens) < 2:
-                        # Try extracting from raw_data
-                        raw_data = market.get('raw_data', {})
-                        tokens = self._extract_tokens_from_market(raw_data)
-                    
-                    if not tokens or len(tokens) < 2:
-                        continue
-                    
-                    # Fetch order books for both tokens (YES and NO)
+                    # Get orderbooks for this market's tokens
                     orderbooks = {}
-                    for token in tokens[:2]:  # Usually YES and NO tokens
-                        orderbook = self.api.get_orderbook(token)
-                        if orderbook:
-                            orderbooks[token] = orderbook
+                    for token in tokens:
+                        if token in token_to_orderbook:
+                            orderbooks[token] = token_to_orderbook[token]
                     
                     if len(orderbooks) < 2:
                         continue
@@ -83,8 +110,7 @@ class OpportunityDetector:
                         self.db.upsert_opportunity(neg_risk_opp)
                         opportunities_found += 1
                     
-                    # Small delay to respect rate limits
-                    time.sleep(0.5)
+                    # No delay needed - batch processing is efficient
                     
                 except Exception as e:
                     logger.error(f"Error detecting opportunities for market {market.get('condition_id')}: {e}")
@@ -123,10 +149,11 @@ class OpportunityDetector:
     def _detect_spread(self, market: dict, orderbooks: dict) -> Optional[dict]:
         """Detect spread opportunities (wide bid-ask spreads)"""
         try:
-            if len(orderbooks) < 2:
+            if not orderbooks or len(orderbooks) == 0:
                 return None
             
             # Get best bid and ask from order books
+            # Prices are already parsed as floats from API client
             best_bids = []
             best_asks = []
             
@@ -134,15 +161,17 @@ class OpportunityDetector:
                 bids = orderbook.get('bids', [])
                 asks = orderbook.get('asks', [])
                 
-                if bids:
+                if bids and len(bids) > 0:
                     # Bids are usually sorted highest first
-                    best_bid = float(bids[0].get('price', 0) if isinstance(bids[0], dict) else bids[0])
-                    best_bids.append(best_bid)
+                    best_bid = bids[0].get('price', 0) if isinstance(bids[0], dict) else float(bids[0]) if isinstance(bids[0], (int, float)) else 0
+                    if best_bid > 0:
+                        best_bids.append(best_bid)
                 
-                if asks:
+                if asks and len(asks) > 0:
                     # Asks are usually sorted lowest first
-                    best_ask = float(asks[0].get('price', 0) if isinstance(asks[0], dict) else asks[0])
-                    best_asks.append(best_ask)
+                    best_ask = asks[0].get('price', 0) if isinstance(asks[0], dict) else float(asks[0]) if isinstance(asks[0], (int, float)) else 0
+                    if best_ask > 0:
+                        best_asks.append(best_ask)
             
             if not best_bids or not best_asks:
                 return None
@@ -159,13 +188,27 @@ class OpportunityDetector:
             
             # Only flag as opportunity if spread is significant (> 1%)
             if spread_percentage > 1.0:
-                # Calculate profit potential (simplified)
-                profit_potential = spread_percentage * 0.5  # Conservative estimate
+                # Calculate profit potential based on spread
+                # More conservative for smaller spreads
+                if spread_percentage > 5.0:
+                    profit_potential = spread_percentage * 0.6
+                elif spread_percentage > 2.0:
+                    profit_potential = spread_percentage * 0.5
+                else:
+                    profit_potential = spread_percentage * 0.4
                 
-                # Calculate confidence based on liquidity
+                # Calculate confidence based on liquidity and order book depth
                 volume = market.get('volume_24h', 0) or 0
                 liquidity = market.get('liquidity', 0) or 0
-                confidence = min(95, 50 + (liquidity / 100000) * 5)  # Scale confidence with liquidity
+                
+                # Base confidence on liquidity
+                base_confidence = 50
+                liquidity_bonus = min(30, (liquidity / 100000) * 5)
+                
+                # Bonus for larger spreads (more reliable)
+                spread_bonus = min(15, spread_percentage * 2)
+                
+                confidence = min(95, base_confidence + liquidity_bonus + spread_bonus)
                 
                 return {
                     'market_id': market.get('condition_id'),
@@ -177,7 +220,8 @@ class OpportunityDetector:
                         'best_bid': round(max_bid, 4),
                         'best_ask': round(min_ask, 4),
                         'volume_24h': volume,
-                        'liquidity': liquidity
+                        'liquidity': liquidity,
+                        'order_book_depth': len(best_bids) + len(best_asks)
                     },
                     'status': 'active'
                 }
@@ -185,13 +229,13 @@ class OpportunityDetector:
             return None
             
         except Exception as e:
-            logger.error(f"Error detecting spread: {e}")
+            logger.error(f"Error detecting spread: {e}", exc_info=True)
             return None
     
     def _detect_arbitrage(self, market: dict, orderbooks: dict) -> Optional[dict]:
         """Detect arbitrage opportunities across tokens"""
         try:
-            if len(orderbooks) < 2:
+            if not orderbooks or len(orderbooks) < 2:
                 return None
             
             # For binary markets, arbitrage exists if YES + NO prices don't sum to ~1.0
@@ -200,10 +244,14 @@ class OpportunityDetector:
                 bids = orderbook.get('bids', [])
                 asks = orderbook.get('asks', [])
                 
-                if bids and asks:
-                    mid_price = (float(bids[0].get('price', 0) if isinstance(bids[0], dict) else bids[0]) + 
-                                float(asks[0].get('price', 0) if isinstance(asks[0], dict) else asks[0])) / 2
-                    prices.append(mid_price)
+                if bids and asks and len(bids) > 0 and len(asks) > 0:
+                    # Prices are already floats from API client
+                    bid_price = bids[0].get('price', 0) if isinstance(bids[0], dict) else float(bids[0]) if isinstance(bids[0], (int, float)) else 0
+                    ask_price = asks[0].get('price', 0) if isinstance(asks[0], dict) else float(asks[0]) if isinstance(asks[0], (int, float)) else 0
+                    
+                    if bid_price > 0 and ask_price > 0:
+                        mid_price = (bid_price + ask_price) / 2
+                        prices.append(mid_price)
             
             if len(prices) < 2:
                 return None
@@ -216,10 +264,18 @@ class OpportunityDetector:
             
             if deviation > 0.02:  # 2% deviation threshold
                 # Calculate profit potential
+                # Can buy all outcomes for total_probability, sell for 1.0
                 profit_potential = deviation * 100  # Convert to percentage
                 
-                # Higher confidence if deviation is larger
-                confidence = min(95, 60 + (deviation * 1000))
+                # Higher confidence if deviation is larger and liquidity is good
+                volume = market.get('volume_24h', 0) or 0
+                liquidity = market.get('liquidity', 0) or 0
+                
+                base_confidence = 60
+                deviation_bonus = min(20, deviation * 500)  # Up to 20% for large deviations
+                liquidity_bonus = min(15, (liquidity / 200000) * 5)  # Up to 15% for high liquidity
+                
+                confidence = min(95, base_confidence + deviation_bonus + liquidity_bonus)
                 
                 return {
                     'market_id': market.get('condition_id'),
@@ -230,7 +286,8 @@ class OpportunityDetector:
                         'total_probability': round(total_probability, 4),
                         'deviation': round(deviation, 4),
                         'prices': [round(p, 4) for p in prices],
-                        'volume_24h': market.get('volume_24h', 0) or 0
+                        'volume_24h': volume,
+                        'liquidity': liquidity
                     },
                     'status': 'active'
                 }
@@ -238,13 +295,13 @@ class OpportunityDetector:
             return None
             
         except Exception as e:
-            logger.error(f"Error detecting arbitrage: {e}")
+            logger.error(f"Error detecting arbitrage: {e}", exc_info=True)
             return None
     
     def _detect_negative_risk(self, market: dict, orderbooks: dict) -> Optional[dict]:
         """Detect negative risk opportunities (sum of probabilities > 100%)"""
         try:
-            if len(orderbooks) < 2:
+            if not orderbooks or len(orderbooks) < 2:
                 return None
             
             # Sum all outcome probabilities
@@ -255,19 +312,30 @@ class OpportunityDetector:
                 bids = orderbook.get('bids', [])
                 asks = orderbook.get('asks', [])
                 
-                if bids and asks:
-                    mid_price = (float(bids[0].get('price', 0) if isinstance(bids[0], dict) else bids[0]) + 
-                                float(asks[0].get('price', 0) if isinstance(asks[0], dict) else asks[0])) / 2
-                    prices.append(mid_price)
-                    total_probability += mid_price
+                if bids and asks and len(bids) > 0 and len(asks) > 0:
+                    # Prices are already floats from API client
+                    bid_price = bids[0].get('price', 0) if isinstance(bids[0], dict) else float(bids[0]) if isinstance(bids[0], (int, float)) else 0
+                    ask_price = asks[0].get('price', 0) if isinstance(asks[0], dict) else float(asks[0]) if isinstance(asks[0], (int, float)) else 0
+                    
+                    if bid_price > 0 and ask_price > 0:
+                        mid_price = (bid_price + ask_price) / 2
+                        prices.append(mid_price)
+                        total_probability += mid_price
             
             if total_probability > 1.0:
                 # Negative risk opportunity - can buy all outcomes for less than $1
                 excess = total_probability - 1.0
                 profit_potential = excess * 100  # Convert to percentage
                 
-                # Higher confidence for larger excess
-                confidence = min(95, 70 + (excess * 500))
+                # Higher confidence for larger excess and good liquidity
+                volume = market.get('volume_24h', 0) or 0
+                liquidity = market.get('liquidity', 0) or 0
+                
+                base_confidence = 70
+                excess_bonus = min(20, excess * 400)  # Up to 20% for large excess
+                liquidity_bonus = min(5, (liquidity / 500000) * 2)  # Small bonus for liquidity
+                
+                confidence = min(95, base_confidence + excess_bonus + liquidity_bonus)
                 
                 return {
                     'market_id': market.get('condition_id'),
@@ -278,7 +346,8 @@ class OpportunityDetector:
                         'total_probability': round(total_probability, 4),
                         'excess': round(excess, 4),
                         'prices': [round(p, 4) for p in prices],
-                        'volume_24h': market.get('volume_24h', 0) or 0
+                        'volume_24h': volume,
+                        'liquidity': liquidity
                     },
                     'status': 'active'
                 }
@@ -286,7 +355,7 @@ class OpportunityDetector:
             return None
             
         except Exception as e:
-            logger.error(f"Error detecting negative risk: {e}")
+            logger.error(f"Error detecting negative risk: {e}", exc_info=True)
             return None
     
     def run(self):

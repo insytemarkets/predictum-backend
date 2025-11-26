@@ -20,7 +20,7 @@ class OrderBookScanner:
         self.scan_interval = 10  # seconds
     
     def scan_orderbooks(self):
-        """Fetch order books for active markets"""
+        """Fetch order books for active markets using batch API when possible"""
         try:
             logger.info("Starting order book scan...")
             
@@ -33,40 +33,84 @@ class OrderBookScanner:
             
             logger.info(f"Scanning order books for {len(markets)} markets")
             
-            scanned_count = 0
+            # Collect all tokens for batch fetching
+            market_tokens_map = {}  # {condition_id: [tokens]}
+            all_tokens = []
             
             for market in markets:
+                condition_id = market.get('condition_id')
+                if not condition_id:
+                    continue
+                
+                # Get tokens for this market (prefer stored tokens)
+                tokens = market.get('tokens') or []
+                if not tokens:
+                    # Try to extract from raw_data
+                    raw_data = market.get('raw_data', {})
+                    if isinstance(raw_data, dict):
+                        if 'stored_tokens' in raw_data:
+                            tokens = raw_data['stored_tokens']
+                        elif 'tokens' in raw_data:
+                            tokens = raw_data['tokens']
+                        else:
+                            tokens = self._extract_tokens(raw_data)
+                    # Fallback to API call
+                    if not tokens:
+                        tokens = self.api.get_market_tokens(condition_id)
+                
+                if tokens:
+                    market_tokens_map[condition_id] = tokens
+                    all_tokens.extend(tokens[:1])  # Use first token (YES) for now
+            
+            if not all_tokens:
+                logger.warning("No tokens found for any markets")
+                return
+            
+            # Batch fetch order books
+            logger.info(f"Batch fetching {len(all_tokens)} order books...")
+            orderbooks = self.api.get_orderbooks_batch(all_tokens)
+            
+            scanned_count = 0
+            token_to_market = {}
+            for condition_id, tokens in market_tokens_map.items():
+                if tokens:
+                    token_to_market[tokens[0]] = condition_id
+            
+            # Process batch results - match by index since order should match
+            for idx, orderbook in enumerate(orderbooks):
                 try:
-                    condition_id = market.get('condition_id')
+                    # Match orderbook to market by index (order should match)
+                    if idx < len(all_tokens):
+                        token_id = all_tokens[idx]
+                        condition_id = token_to_market.get(token_id)
+                        
+                        # Fallback: try matching by asset_id or market field
+                        if not condition_id:
+                            asset_id = orderbook.get('asset_id')
+                            market_id = orderbook.get('market')
+                            for tid, cid in token_to_market.items():
+                                if str(tid) == str(asset_id) or str(tid) == str(market_id):
+                                    condition_id = cid
+                                    break
+                    
                     if not condition_id:
                         continue
                     
-                    # Get tokens for this market
-                    tokens = self.api.get_market_tokens(condition_id)
-                    if not tokens:
-                        # Try to extract from raw_data
-                        raw_data = market.get('raw_data', {})
-                        tokens = self._extract_tokens(raw_data)
+                    bids = orderbook.get('bids', [])
+                    asks = orderbook.get('asks', [])
                     
-                    if not tokens:
-                        logger.debug(f"No tokens found for market {condition_id}")
-                        continue
-                    
-                    # Fetch order book for first token (typically YES outcome)
-                    orderbook = self.api.get_orderbook(tokens[0])
-                    if orderbook:
-                        bids = orderbook.get('bids', [])
-                        asks = orderbook.get('asks', [])
+                    if bids or asks:
+                        metadata = {
+                            'min_order_size': orderbook.get('min_order_size'),
+                            'tick_size': orderbook.get('tick_size'),
+                            'neg_risk': orderbook.get('neg_risk', False),
+                            'timestamp': orderbook.get('timestamp')
+                        }
+                        self.db.insert_orderbook(condition_id, bids, asks, metadata)
+                        scanned_count += 1
                         
-                        if bids or asks:
-                            self.db.insert_orderbook(condition_id, bids, asks)
-                            scanned_count += 1
-                    
-                    # Small delay to respect rate limits
-                    time.sleep(0.5)
-                    
                 except Exception as e:
-                    logger.error(f"Error scanning orderbook for market {market.get('condition_id')}: {e}")
+                    logger.error(f"Error processing batch orderbook: {e}")
                     continue
             
             logger.info(f"Scanned {scanned_count} order books")

@@ -40,7 +40,16 @@ class StatsAggregator:
                         continue
                     
                     # Get tokens
-                    tokens = self.api.get_market_tokens(condition_id)
+                    tokens = market.get('tokens') or []
+                    if not tokens:
+                        raw_data = market.get('raw_data', {})
+                        if 'stored_tokens' in raw_data:
+                            tokens = raw_data['stored_tokens']
+                        elif 'tokens' in raw_data:
+                            tokens = raw_data['tokens']
+                        else:
+                            tokens = self.api.get_market_tokens(condition_id)
+                    
                     if not tokens:
                         continue
                     
@@ -73,21 +82,27 @@ class StatsAggregator:
             bids = orderbook.get('bids', [])
             asks = orderbook.get('asks', [])
             
-            if not bids or not asks:
+            if not bids or not asks or len(bids) == 0 or len(asks) == 0:
                 return None
             
-            # Calculate spread
-            best_bid = float(bids[0].get('price', 0) if isinstance(bids[0], dict) else bids[0])
-            best_ask = float(asks[0].get('price', 0) if isinstance(asks[0], dict) else asks[0])
+            # Prices are already floats from API client
+            best_bid = bids[0].get('price', 0) if isinstance(bids[0], dict) else float(bids[0]) if isinstance(bids[0], (int, float)) else 0
+            best_ask = asks[0].get('price', 0) if isinstance(asks[0], dict) else float(asks[0]) if isinstance(asks[0], (int, float)) else 0
             
-            if best_ask <= 0:
+            if best_ask <= 0 or best_bid <= 0:
                 return None
             
             spread_percentage = ((best_ask - best_bid) / best_ask) * 100
             
-            # Calculate buy/sell pressure from order book depth
-            total_bid_size = sum(float(bid.get('size', 0) if isinstance(bid, dict) else bid) for bid in bids[:10])
-            total_ask_size = sum(float(ask.get('size', 0) if isinstance(ask, dict) else ask) for ask in asks[:10])
+            # Calculate buy/sell pressure from order book depth (top 10 levels)
+            total_bid_size = sum(
+                bid.get('size', 0) if isinstance(bid, dict) else float(bid) if isinstance(bid, (int, float)) else 0
+                for bid in bids[:10]
+            )
+            total_ask_size = sum(
+                ask.get('size', 0) if isinstance(ask, dict) else float(ask) if isinstance(ask, (int, float)) else 0
+                for ask in asks[:10]
+            )
             
             total_size = total_bid_size + total_ask_size
             if total_size > 0:
@@ -104,7 +119,7 @@ class StatsAggregator:
             }
             
         except Exception as e:
-            logger.error(f"Error calculating stats: {e}")
+            logger.error(f"Error calculating stats: {e}", exc_info=True)
             return None
     
     def run(self):

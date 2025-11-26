@@ -20,6 +20,7 @@ class PolymarketAPI:
     def __init__(self):
         self.gamma_base = "https://gamma-api.polymarket.com"
         self.clob_base = "https://clob.polymarket.com"
+        self.data_api_base = "https://data-api.polymarket.com"
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Predictum/1.0',
@@ -52,11 +53,10 @@ class PolymarketAPI:
     
     def get_markets(self, limit: int = 100, active: bool = True, closed: bool = False) -> List[Dict]:
         """
-        Fetch markets from GAMMA API
-        Returns list of market events
-        GAMMA API /events endpoint doesn't accept those params - returns 422
+        Fetch markets from Polymarket API
+        Tries multiple endpoints: /events, /markets, data-api
         """
-        # GAMMA API /events returns all events, we'll filter client-side if needed
+        # Try GAMMA API /events endpoint first
         data = self._get_gamma('/events')
         
         if data:
@@ -82,6 +82,30 @@ class PolymarketAPI:
                     return filtered[:limit]
                 return markets[:limit]
         
+        # Fallback: Try /markets endpoint
+        logger.info("Trying /markets endpoint as fallback...")
+        data = self._get_gamma('/markets')
+        if data:
+            if isinstance(data, list):
+                return data[:limit]
+            if isinstance(data, dict) and 'data' in data:
+                return data['data'][:limit] if isinstance(data['data'], list) else []
+        
+        # Fallback: Try data-api endpoint
+        logger.info("Trying data-api endpoint as fallback...")
+        try:
+            rate_limiter.wait_gamma()  # Use same rate limiter
+            response = self.session.get(f"{self.data_api_base}/markets", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    return data[:limit]
+                if isinstance(data, dict) and 'data' in data:
+                    return data['data'][:limit] if isinstance(data['data'], list) else []
+        except Exception as e:
+            logger.error(f"Data-API error: {e}")
+        
+        logger.warning("All market endpoints returned no data")
         return []
     
     def get_market_by_slug(self, slug: str) -> Optional[Dict]:

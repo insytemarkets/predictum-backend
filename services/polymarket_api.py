@@ -354,11 +354,82 @@ class PolymarketAPI:
         return []
     
     def get_trades(self, token_id: str, limit: int = 100) -> List[Dict]:
-        """Get recent trades for a token"""
-        data = self._get_clob(f'/trades', params={'token': token_id, 'limit': limit})
+        """
+        Get recent trades for a token
+        Per docs: https://docs.polymarket.com/developers/CLOB/trades/trades
+        """
+        # Try with token_id param first (per newer docs)
+        data = self._get_clob('/trades', params={'token_id': token_id, 'limit': limit})
         if data and isinstance(data, list):
             return data
+        
+        # Fallback to 'token' param
+        data = self._get_clob('/trades', params={'token': token_id, 'limit': limit})
+        if data and isinstance(data, list):
+            return data
+        
+        # Fallback to 'asset_id' param
+        data = self._get_clob('/trades', params={'asset_id': token_id, 'limit': limit})
+        if data and isinstance(data, list):
+            return data
+            
         return []
+    
+    def get_price_history(self, token_id: str, interval: str = '1h', fidelity: int = 100) -> List[Dict]:
+        """
+        Get price history for a token
+        Per docs: https://docs.polymarket.com/api-reference/pricing/get-price-history-for-a-traded-token
+        
+        Args:
+            token_id: The token ID
+            interval: Time interval ('1m', '5m', '1h', '1d')
+            fidelity: Number of data points (max 1000)
+        
+        Returns:
+            List of {timestamp, price} objects
+        """
+        params = {
+            'token_id': token_id,
+            'interval': interval,
+            'fidelity': min(fidelity, 1000)
+        }
+        
+        data = self._get_clob('/price-history', params=params)
+        
+        if not data:
+            return []
+        
+        # Parse response - could be list or dict with 'history' key
+        history = []
+        if isinstance(data, list):
+            history = data
+        elif isinstance(data, dict):
+            history = data.get('history') or data.get('prices') or data.get('data') or []
+        
+        # Normalize to consistent format
+        result = []
+        for item in history:
+            if isinstance(item, dict):
+                result.append({
+                    'timestamp': item.get('t') or item.get('timestamp') or item.get('time'),
+                    'price': float(item.get('p') or item.get('price') or item.get('value') or 0)
+                })
+            elif isinstance(item, list) and len(item) >= 2:
+                result.append({
+                    'timestamp': item[0],
+                    'price': float(item[1])
+                })
+        
+        return result
+    
+    def get_price_history_batch(self, token_ids: List[str], interval: str = '1h') -> Dict[str, List[Dict]]:
+        """Get price history for multiple tokens"""
+        result = {}
+        for token_id in token_ids[:20]:  # Limit to prevent rate limiting
+            history = self.get_price_history(token_id, interval=interval)
+            if history:
+                result[token_id] = history
+        return result
     
     def get_market_tokens(self, condition_id: str) -> Optional[List[str]]:
         """

@@ -42,69 +42,71 @@ class SupabaseClient:
                 except (ValueError, TypeError):
                     return default
             
-            # Build the data object with ALL the rich fields
+            # Build the data object - ONLY include columns that exist in your schema
+            # Core fields that should always exist
             data = {
-                # Core identifiers
                 'condition_id': str(condition_id),
                 'question': str(market_data.get('question', '')),
                 'slug': str(market_data.get('slug', condition_id)),
                 'url': str(market_data.get('url', f"https://polymarket.com/event/{condition_id}")),
-                
-                # Volume metrics - THE JUICE
                 'volume_24h': safe_float(market_data.get('volume_24h')),
+                'liquidity': safe_float(market_data.get('liquidity')),
+                'current_price': safe_float(market_data.get('current_price'), 0.5),
+                'end_date': market_data.get('end_date'),
+                'tokens': market_data.get('tokens', []),
+                'raw_data': market_data.get('raw_data', {})
+            }
+            
+            # Try to add optional rich data fields - these may not exist yet
+            # They'll be ignored if columns don't exist (we catch the error)
+            optional_fields = {
                 'volume_7d': safe_float(market_data.get('volume_7d')),
                 'volume_30d': safe_float(market_data.get('volume_30d')),
                 'volume_velocity': safe_float(market_data.get('volume_velocity'), 1.0),
-                'liquidity': safe_float(market_data.get('liquidity')),
-                
-                # Price intelligence
-                'current_price': safe_float(market_data.get('current_price'), 0.5),
                 'price_change_24h': safe_float(market_data.get('price_change_24h')),
                 'price_change_7d': safe_float(market_data.get('price_change_7d')),
                 'price_change_30d': safe_float(market_data.get('price_change_30d')),
                 'last_trade_price': safe_float(market_data.get('last_trade_price')) if market_data.get('last_trade_price') else None,
-                
-                # Orderbook data
                 'best_bid': safe_float(market_data.get('best_bid')) if market_data.get('best_bid') else None,
                 'best_ask': safe_float(market_data.get('best_ask')) if market_data.get('best_ask') else None,
                 'spread': safe_float(market_data.get('spread')),
-                
-                # Alpha signals
                 'neg_risk': bool(market_data.get('neg_risk', False)),
                 'neg_risk_market_id': market_data.get('neg_risk_market_id'),
                 'competitive_score': safe_float(market_data.get('competitive_score')),
                 'accepting_orders': bool(market_data.get('accepting_orders', True)),
-                
-                # Rewards
                 'has_rewards': bool(market_data.get('has_rewards', False)),
                 'rewards_daily_rate': safe_float(market_data.get('rewards_daily_rate')),
-                'rewards_min_size': safe_float(market_data.get('rewards_min_size')) if market_data.get('rewards_min_size') else None,
-                'rewards_max_spread': safe_float(market_data.get('rewards_max_spread')) if market_data.get('rewards_max_spread') else None,
-                
-                # Metadata
                 'category': str(market_data.get('category', '')),
                 'image_url': str(market_data.get('image_url', '')),
-                'end_date': market_data.get('end_date'),
                 'active': bool(market_data.get('active', True)),
                 'closed': bool(market_data.get('closed', False)),
-                
-                # Token data
-                'tokens': market_data.get('tokens', []),
                 'outcomes': market_data.get('outcomes', []),
                 'outcome_prices': market_data.get('outcome_prices', []),
-                
-                # Raw data for debugging
-                'raw_data': market_data.get('raw_data', {})
             }
             
-            result = self.client.table('markets').upsert(
-                data,
-                on_conflict='condition_id'
-            ).execute()
+            # First try with all fields
+            full_data = {**data, **optional_fields}
             
-            if result.data:
-                return result.data[0] if isinstance(result.data, list) else result.data
-            return None
+            try:
+                result = self.client.table('markets').upsert(
+                    full_data,
+                    on_conflict='condition_id'
+                ).execute()
+                
+                if result.data:
+                    return result.data[0] if isinstance(result.data, list) else result.data
+                return None
+            except Exception as full_err:
+                # If full insert fails (missing columns), try with just core fields
+                logger.warning(f"Full upsert failed, trying core fields only: {full_err}")
+                result = self.client.table('markets').upsert(
+                    data,
+                    on_conflict='condition_id'
+                ).execute()
+                
+                if result.data:
+                    return result.data[0] if isinstance(result.data, list) else result.data
+                return None
         except Exception as e:
             logger.error(f"Error upserting market: {e}", exc_info=True)
             return None

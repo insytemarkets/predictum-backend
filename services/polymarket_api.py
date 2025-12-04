@@ -1,11 +1,22 @@
 """
-Polymarket API Client
-Supports both GAMMA API and CLOB API with rate limiting
+Polymarket API Client v2.0
+Extracts ALL the rich data from GAMMA and CLOB APIs
+"Everyone has access to the information. We just know how to analyze it better."
+
+Rate limits (from https://docs.polymarket.com/quickstart/introduction/rate-limits):
+- GAMMA /events: 100 requests / 10s
+- GAMMA /markets: 125 requests / 10s
+- CLOB /book: 200 requests / 10s
+- CLOB /books (batch): 80 requests / 10s
+- CLOB /price: 200 requests / 10s
+- CLOB /spread: 200 requests / 10s
+- CLOB Price History: 100 requests / 10s
 """
 import requests
 import logging
 import sys
 import os
+import json
 from typing import Dict, List, Optional, Any
 
 # Add parent directory to path for imports
@@ -14,518 +25,468 @@ from utils.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 
+
+def parse_json_field(field: Any) -> Any:
+    """Parse field that might be a JSON string or already parsed"""
+    if field is None:
+        return None
+    if isinstance(field, (list, dict)):
+        return field
+    if isinstance(field, str):
+        try:
+            return json.loads(field)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return field
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """Safely convert value to float"""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
 class PolymarketAPI:
-    """Client for Polymarket APIs with rate limiting"""
+    """
+    Enhanced Polymarket API Client
+    Extracts EVERYTHING useful from the APIs
+    """
     
     def __init__(self):
         self.gamma_base = "https://gamma-api.polymarket.com"
         self.clob_base = "https://clob.polymarket.com"
-        self.data_api_base = "https://data-api.polymarket.com"
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Predictum/1.0',
+            'User-Agent': 'Predictum/2.0',
             'Accept': 'application/json'
         })
     
-    def _get_gamma(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make a GET request to GAMMA API with rate limiting"""
-        rate_limiter.wait_gamma()
+    def _get_gamma(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Any]:
+        """Make a GET request to GAMMA API with endpoint-specific rate limiting"""
+        # Determine endpoint type for rate limiting
+        if '/events' in endpoint:
+            rate_limiter.wait_gamma("events")
+        elif '/markets' in endpoint:
+            rate_limiter.wait_gamma("markets")
+        else:
+            rate_limiter.wait_gamma("general")
+        
         url = f"{self.gamma_base}{endpoint}"
         try:
-            response = self.session.get(url, params=params, timeout=10)
+            response = self.session.get(url, params=params, timeout=15)
             if response.status_code == 422:
-                # 422 means invalid params - log but don't error
-                logger.debug(f"GAMMA API 422 for {endpoint} with params {params} - returning None")
+                logger.debug(f"GAMMA API 422 for {endpoint} - invalid params")
+                return None
+            if response.status_code == 429:
+                logger.warning(f"GAMMA API rate limited on {endpoint} - backing off")
                 return None
             response.raise_for_status()
-            data = response.json()
-            # Log if we get empty/null response
-            if not data:
-                logger.warning(f"GAMMA API returned empty response for {endpoint}")
-            elif isinstance(data, dict) and not any(k in data for k in ['data', 'events', 'results']):
-                logger.debug(f"GAMMA API response structure for {endpoint}: {list(data.keys())[:5]}")
-            return data
+            return response.json()
         except requests.exceptions.RequestException as e:
             logger.error(f"GAMMA API error ({endpoint}): {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response status: {e.response.status_code}, body: {e.response.text[:200]}")
             return None
     
-    def _get_clob(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make a GET request to CLOB API with rate limiting"""
-        rate_limiter.wait_clob()
+    def _get_clob(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Any]:
+        """Make a GET request to CLOB API with endpoint-specific rate limiting"""
+        # Determine endpoint type for rate limiting
+        if endpoint == '/book':
+            rate_limiter.wait_clob("book")
+        elif endpoint == '/price':
+            rate_limiter.wait_clob("price")
+        elif endpoint == '/spread':
+            rate_limiter.wait_clob("spread")
+        elif endpoint == '/midpoint':
+            rate_limiter.wait_clob("midpoint")
+        elif '/prices-history' in endpoint:
+            rate_limiter.wait_clob("history")
+        else:
+            rate_limiter.wait_clob("general")
+        
         url = f"{self.clob_base}{endpoint}"
         try:
-            response = self.session.get(url, params=params, timeout=10)
+            response = self.session.get(url, params=params, timeout=15)
+            if response.status_code == 429:
+                logger.warning(f"CLOB API rate limited on {endpoint} - backing off")
+                return None
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
             logger.error(f"CLOB API error ({endpoint}): {e}")
             return None
     
-    def get_markets(self, limit: int = 100, active: bool = True, closed: bool = False) -> List[Dict]:
-        """
-        Fetch markets from Polymarket GAMMA API
-        GAMMA API returns EVENTS which contain MARKETS
-        Structure: Event -> markets[] -> each market has conditionId and clobTokenIds
-        """
-        # Try GAMMA API /events endpoint with query params
-        # IMPORTANT: closed=false is required to get only open/active markets
-        params = {'closed': 'false' if not closed else 'true'}
-        if limit:
-            params['limit'] = limit
+    def _post_clob(self, endpoint: str, json_data: Any) -> Optional[Any]:
+        """Make a POST request to CLOB API with batch rate limiting"""
+        # Batch endpoints have lower limits
+        if endpoint == '/books':
+            rate_limiter.wait_clob("books")
+        elif endpoint == '/prices':
+            rate_limiter.wait_clob("prices")
+        else:
+            rate_limiter.wait_clob("general")
         
-        data = self._get_gamma('/events', params=params)
+        url = f"{self.clob_base}{endpoint}"
+        try:
+            response = self.session.post(url, json=json_data, timeout=15)
+            if response.status_code == 429:
+                logger.warning(f"CLOB API rate limited on {endpoint} - backing off")
+                return None
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"CLOB API POST error ({endpoint}): {e}")
+            return None
+    
+    def get_markets(self, limit: int = 200) -> List[Dict]:
+        """
+        Fetch markets from GAMMA API with ALL the rich data
+        This is where the magic happens
+        """
+        # Fetch active markets
+        data = self._get_gamma('/events', params={'closed': 'false'})
         
         if not data:
             logger.warning("GAMMA API /events returned no data")
             return []
         
+        # Handle response format
         events = []
         if isinstance(data, list):
             events = data
         elif isinstance(data, dict):
-            # Extract from common wrapper keys
             events = data.get('data') or data.get('events') or data.get('results') or []
         
         if not events:
-            logger.warning("No events found in GAMMA API response")
+            logger.warning("No events in GAMMA response")
             return []
         
         logger.info(f"GAMMA API returned {len(events)} events")
         
-        # Filter events by active/closed status (redundant if params work, but safe)
-        if active:
-            events = [e for e in events if e.get('active', True) and not e.get('closed', False)]
-        
+        # Filter to only active, non-closed markets
+        events = [e for e in events if e.get('active', True) and not e.get('closed', False)]
         logger.info(f"After filtering: {len(events)} active events")
         
-        # Helper to parse JSON strings (clobTokenIds can be a JSON string)
-        import json
-        def parse_json_field(field):
-            """Parse field that might be a JSON string or already a list"""
-            if isinstance(field, list):
-                return field
-            elif isinstance(field, str):
-                try:
-                    parsed = json.loads(field)
-                    if isinstance(parsed, list):
-                        return parsed
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            return []
-        
-        # Extract individual markets from events
-        # Each event can have multiple markets in its 'markets' array
+        # Extract individual markets with ALL the data
         all_markets = []
+        
         for event in events:
             event_markets = event.get('markets', [])
             
+            # If event has nested markets, process each
             if event_markets:
                 for market in event_markets:
                     if isinstance(market, dict):
-                        # Parse clobTokenIds which might be a JSON string
-                        clob_tokens = parse_json_field(market.get('clobTokenIds', []))
-                        
-                        # Flatten: copy event-level data to market
-                        market_data = {
-                            'conditionId': market.get('conditionId') or market.get('condition_id'),
-                            'question': market.get('question') or event.get('title', ''),
-                            'slug': market.get('slug') or event.get('slug', ''),
-                            'volume': market.get('volumeNum') or market.get('volume') or event.get('volume', 0),
-                            'volume24hr': market.get('volume24hr') or event.get('volume24hr', 0),
-                            'liquidity': market.get('liquidityNum') or market.get('liquidity') or event.get('liquidity', 0),
-                            'endDate': market.get('endDate') or event.get('endDate'),
-                            'active': market.get('active', True),
-                            'closed': market.get('closed', False),
-                            'category': market.get('category') or event.get('category', ''),
-                            # IMPORTANT: Extract token IDs from market (parsed from JSON string)
-                            'clobTokenIds': clob_tokens,
-                            'outcomes': parse_json_field(market.get('outcomes', [])),
-                            'outcomePrices': parse_json_field(market.get('outcomePrices', [])),
-                            # Store raw data for later use
-                            'raw_data': market
-                        }
-                        all_markets.append(market_data)
-                        
-                        if clob_tokens:
-                            logger.debug(f"Extracted {len(clob_tokens)} tokens for market {market_data['conditionId']}")
+                        market_data = self._extract_market_data(market, event)
+                        if market_data:
+                            all_markets.append(market_data)
             else:
-                # Event itself might be a single market (legacy format)
+                # Event itself is a market
                 if event.get('conditionId') or event.get('condition_id'):
-                    clob_tokens = parse_json_field(event.get('clobTokenIds', []))
-                    market_data = {
-                        'conditionId': event.get('conditionId') or event.get('condition_id'),
-                        'question': event.get('title') or event.get('question', ''),
-                        'slug': event.get('slug', ''),
-                        'volume': event.get('volume', 0),
-                        'volume24hr': event.get('volume24hr', 0),
-                        'liquidity': event.get('liquidity', 0),
-                        'endDate': event.get('endDate'),
-                        'active': event.get('active', True),
-                        'closed': event.get('closed', False),
-                        'category': event.get('category', ''),
-                        'clobTokenIds': clob_tokens,
-                        'outcomes': parse_json_field(event.get('outcomes', [])),
-                        'outcomePrices': parse_json_field(event.get('outcomePrices', [])),
-                        'raw_data': event
-                    }
-                    all_markets.append(market_data)
+                    market_data = self._extract_market_data(event, event)
+                    if market_data:
+                        all_markets.append(market_data)
         
-        logger.info(f"Extracted {len(all_markets)} individual markets from events")
+        logger.info(f"Extracted {len(all_markets)} markets with rich data")
         
-        # Sort by volume and return limited results
-        all_markets.sort(key=lambda x: float(x.get('volume24hr') or x.get('volume') or 0), reverse=True)
+        # Sort by 24h volume (most active first)
+        all_markets.sort(
+            key=lambda x: safe_float(x.get('volume_24h') or x.get('volume_total')), 
+            reverse=True
+        )
+        
         return all_markets[:limit]
     
-    def get_market_by_slug(self, slug: str) -> Optional[Dict]:
-        """Get a specific market by slug"""
-        return self._get_gamma(f'/events/{slug}')
-    
-    def get_market_prices(self, condition_id: str) -> Optional[Dict]:
-        """Get current prices for a market condition from GAMMA API"""
-        return self._get_gamma(f'/prices/{condition_id}')
-    
-    def get_price(self, token_id: str, side: str = 'BUY') -> Optional[float]:
+    def _extract_market_data(self, market: Dict, event: Dict) -> Optional[Dict]:
         """
-        Get current price for a token from CLOB API
-        Per docs: https://docs.polymarket.com/api-reference/pricing/get-market-price
+        Extract ALL the rich data from a market object
+        This is THE JUICE
         """
-        params = {'token_id': token_id, 'side': side}
-        data = self._get_clob('/price', params=params)
+        condition_id = market.get('conditionId') or market.get('condition_id')
+        if not condition_id:
+            return None
         
-        if data and isinstance(data, dict):
-            price = data.get('price') or data.get('value')
-            if price:
-                return float(price) if isinstance(price, (int, float)) else float(str(price))
-        return None
-    
-    def get_prices_batch(self, token_ids: List[str]) -> Dict[str, float]:
-        """
-        Get prices for multiple tokens using POST /prices endpoint
-        Per docs: https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request
-        """
-        if not token_ids:
-            return {}
+        # Parse JSON fields
+        clob_tokens = parse_json_field(market.get('clobTokenIds', []))
+        outcomes = parse_json_field(market.get('outcomes', []))
+        outcome_prices = parse_json_field(market.get('outcomePrices', []))
+        clob_rewards = parse_json_field(market.get('clobRewards', []))
         
-        payload = [{'token_id': token_id} for token_id in token_ids[:500]]  # Max 500
+        # Calculate current price (YES price)
+        current_price = 0.5
+        if outcome_prices and len(outcome_prices) > 0:
+            current_price = safe_float(outcome_prices[0], 0.5)
         
-        data = self._post_clob('/prices', json_data=payload)
+        # Extract rewards info
+        has_rewards = len(clob_rewards) > 0 if isinstance(clob_rewards, list) else False
+        rewards_daily_rate = 0
+        if has_rewards and isinstance(clob_rewards, list) and len(clob_rewards) > 0:
+            rewards_daily_rate = safe_float(clob_rewards[0].get('rewardsDailyRate', 0))
         
-        prices = {}
-        if isinstance(data, list):
-            for item in data:
-                token_id = item.get('token_id') or item.get('tokenId')
-                price = item.get('price') or item.get('value')
-                if token_id and price:
-                    prices[token_id] = float(price) if isinstance(price, (int, float)) else float(str(price))
+        # Calculate volume velocity (24h volume vs 7d daily average)
+        volume_24h = safe_float(market.get('volume24hr') or market.get('volume24hrClob'))
+        volume_7d = safe_float(market.get('volume1wk') or market.get('volume1wkClob'))
+        volume_velocity = 1.0
+        if volume_7d > 0:
+            daily_avg = volume_7d / 7
+            if daily_avg > 0:
+                volume_velocity = volume_24h / daily_avg
         
-        return prices
-    
-    def get_midpoint_price(self, token_id: str) -> Optional[float]:
-        """
-        Get midpoint price for a token from CLOB API
-        Per docs: https://docs.polymarket.com/api-reference/pricing/get-midpoint-price
-        """
-        params = {'token_id': token_id}
-        data = self._get_clob('/midpoint', params=params)
-        
-        if data and isinstance(data, dict):
-            midpoint = data.get('midpoint') or data.get('price') or data.get('value')
-            if midpoint:
-                return float(midpoint) if isinstance(midpoint, (int, float)) else float(str(midpoint))
-        return None
-    
-    def get_bid_ask_spreads(self, token_ids: List[str]) -> Dict[str, Dict]:
-        """
-        Get bid-ask spreads for multiple tokens
-        Per docs: https://docs.polymarket.com/api-reference/spreads/get-bid-ask-spreads
-        """
-        if not token_ids:
-            return {}
-        
-        # Build query string with token_ids
-        token_params = '&'.join([f'token_ids={token_id}' for token_id in token_ids[:100]])  # Reasonable limit
-        endpoint = f'/spreads?{token_params}'
-        
-        rate_limiter.wait_clob()
-        url = f"{self.clob_base}{endpoint}"
-        try:
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
-            data = response.json()
+        return {
+            # Core identifiers
+            'condition_id': condition_id,
+            'question': market.get('question') or event.get('title', ''),
+            'slug': market.get('slug') or event.get('slug', ''),
+            'description': market.get('description', ''),
             
-            spreads = {}
-            if isinstance(data, dict):
-                # Response might be {token_id: {bid: X, ask: Y, spread: Z}}
-                for token_id, spread_data in data.items():
-                    if isinstance(spread_data, dict):
-                        spreads[token_id] = {
-                            'bid': float(spread_data.get('bid', 0)),
-                            'ask': float(spread_data.get('ask', 0)),
-                            'spread': float(spread_data.get('spread', 0)),
-                            'spread_percent': float(spread_data.get('spread_percent', 0))
-                        }
-            elif isinstance(data, list):
-                # Response might be list of {token_id, bid, ask, spread}
-                for item in data:
-                    token_id = item.get('token_id') or item.get('tokenId')
-                    if token_id:
-                        spreads[token_id] = {
-                            'bid': float(item.get('bid', 0)),
-                            'ask': float(item.get('ask', 0)),
-                            'spread': float(item.get('spread', 0)),
-                            'spread_percent': float(item.get('spread_percent', 0))
-                        }
+            # VOLUME METRICS - THE JUICE
+            'volume_total': safe_float(market.get('volumeNum') or market.get('volume') or market.get('volumeClob')),
+            'volume_24h': volume_24h,
+            'volume_7d': volume_7d,
+            'volume_30d': safe_float(market.get('volume1mo') or market.get('volume1moClob')),
+            'volume_velocity': round(volume_velocity, 2),
             
-            return spreads
-        except requests.exceptions.RequestException as e:
-            logger.error(f"CLOB API spreads error (/spreads): {e}")
-            return {}
+            # PRICE INTELLIGENCE
+            'current_price': current_price,
+            'price_change_24h': safe_float(market.get('oneDayPriceChange')),
+            'price_change_7d': safe_float(market.get('oneWeekPriceChange')),
+            'price_change_30d': safe_float(market.get('oneMonthPriceChange')),
+            'last_trade_price': safe_float(market.get('lastTradePrice')),
+            
+            # ORDERBOOK DATA
+            'best_bid': safe_float(market.get('bestBid')),
+            'best_ask': safe_float(market.get('bestAsk')),
+            'spread': safe_float(market.get('spread')),
+            'liquidity': safe_float(market.get('liquidityNum') or market.get('liquidity') or market.get('liquidityClob')),
+            
+            # ALPHA SIGNALS - THE REAL GOLD
+            'neg_risk': bool(market.get('negRisk', False)),
+            'neg_risk_market_id': market.get('negRiskMarketID') or market.get('negRiskRequestID'),
+            'competitive_score': safe_float(market.get('competitive')),
+            'accepting_orders': bool(market.get('acceptingOrders', True)),
+            
+            # REWARDS
+            'has_rewards': has_rewards,
+            'rewards_daily_rate': rewards_daily_rate,
+            'rewards_min_size': safe_float(market.get('rewardsMinSize')),
+            'rewards_max_spread': safe_float(market.get('rewardsMaxSpread')),
+            
+            # METADATA
+            'category': market.get('category') or event.get('category', ''),
+            'image_url': market.get('image') or market.get('icon', ''),
+            'end_date': market.get('endDate') or event.get('endDate'),
+            'active': bool(market.get('active', True)),
+            'closed': bool(market.get('closed', False)),
+            
+            # TOKEN DATA
+            'clob_token_ids': clob_tokens,
+            'outcomes': outcomes,
+            'outcome_prices': outcome_prices,
+            
+            # RAW DATA (for debugging/future use)
+            'raw_data': market
+        }
     
     def get_orderbook(self, token_id: str) -> Optional[Dict]:
         """
-        Get order book for a token from CLOB API
-        Returns bids and asks with parsed prices/sizes
-        Per docs: https://docs.polymarket.com/api-reference/orderbook/get-order-book-summary
+        Get full orderbook for a token
+        Returns bids, asks, spread, depth
         """
-        # Correct endpoint format: /book?token_id=<TOKEN_ID>
-        params = {'token_id': token_id}
-        data = self._get_clob('/book', params=params)
+        data = self._get_clob('/book', params={'token_id': token_id})
         
-        if data and isinstance(data, dict):
-            # Parse string prices/sizes to floats for easier use
-            if 'bids' in data and isinstance(data['bids'], list):
-                data['bids'] = [
-                    {
-                        'price': float(bid.get('price', 0)) if isinstance(bid, dict) else float(bid[0]) if isinstance(bid, list) else 0,
-                        'size': float(bid.get('size', 0)) if isinstance(bid, dict) else float(bid[1]) if isinstance(bid, list) else 0
-                    }
-                    for bid in data['bids']
-                ]
-            
-            if 'asks' in data and isinstance(data['asks'], list):
-                data['asks'] = [
-                    {
-                        'price': float(ask.get('price', 0)) if isinstance(ask, dict) else float(ask[0]) if isinstance(ask, list) else 0,
-                        'size': float(ask.get('size', 0)) if isinstance(ask, dict) else float(ask[1]) if isinstance(ask, list) else 0
-                    }
-                    for ask in data['asks']
-                ]
-            
-            return data
+        if not data or not isinstance(data, dict):
+            return None
         
-        return None
+        # Parse bids and asks
+        bids = []
+        asks = []
+        
+        for bid in data.get('bids', []):
+            if isinstance(bid, dict):
+                bids.append({
+                    'price': safe_float(bid.get('price')),
+                    'size': safe_float(bid.get('size'))
+                })
+        
+        for ask in data.get('asks', []):
+            if isinstance(ask, dict):
+                asks.append({
+                    'price': safe_float(ask.get('price')),
+                    'size': safe_float(ask.get('size'))
+                })
+        
+        # Sort
+        bids.sort(key=lambda x: x['price'], reverse=True)
+        asks.sort(key=lambda x: x['price'])
+        
+        # Calculate spread
+        spread = 0
+        best_bid = bids[0]['price'] if bids else 0
+        best_ask = asks[0]['price'] if asks else 1
+        if best_bid > 0:
+            spread = best_ask - best_bid
+        
+        # Calculate depth
+        bid_depth = sum(b['price'] * b['size'] for b in bids[:10])
+        ask_depth = sum(a['price'] * a['size'] for a in asks[:10])
+        
+        return {
+            'token_id': token_id,
+            'bids': bids,
+            'asks': asks,
+            'best_bid': best_bid,
+            'best_ask': best_ask,
+            'spread': spread,
+            'spread_percent': (spread / best_bid * 100) if best_bid > 0 else 0,
+            'bid_depth': bid_depth,
+            'ask_depth': ask_depth,
+            'imbalance': (bid_depth - ask_depth) / (bid_depth + ask_depth) if (bid_depth + ask_depth) > 0 else 0,
+            'tick_size': safe_float(data.get('tick_size', 0.001)),
+            'min_order_size': safe_float(data.get('min_order_size', 5)),
+            'neg_risk': bool(data.get('neg_risk', False))
+        }
     
-    def get_orderbooks_batch(self, token_ids: List[str]) -> List[Dict]:
-        """
-        Get multiple order books using POST /books endpoint
-        Per docs: https://docs.polymarket.com/api-reference/orderbook/get-multiple-order-books-summaries-by-request
-        """
+    def get_orderbooks_batch(self, token_ids: List[str]) -> Dict[str, Dict]:
+        """Get orderbooks for multiple tokens"""
         if not token_ids:
-            return []
+            return {}
         
-        # Prepare request body
-        payload = [{'token_id': token_id} for token_id in token_ids[:500]]  # Max 500 per docs
-        
+        # Batch request
+        payload = [{'token_id': tid} for tid in token_ids[:100]]
         data = self._post_clob('/books', json_data=payload)
         
-        if isinstance(data, list):
-            # Parse prices/sizes for each order book
-            for orderbook in data:
-                if 'bids' in orderbook and isinstance(orderbook['bids'], list):
-                    orderbook['bids'] = [
-                        {
-                            'price': float(bid.get('price', 0)) if isinstance(bid, dict) else 0,
-                            'size': float(bid.get('size', 0)) if isinstance(bid, dict) else 0
-                        }
-                        for bid in orderbook['bids']
-                    ]
-                if 'asks' in orderbook and isinstance(orderbook['asks'], list):
-                    orderbook['asks'] = [
-                        {
-                            'price': float(ask.get('price', 0)) if isinstance(ask, dict) else 0,
-                            'size': float(ask.get('size', 0)) if isinstance(ask, dict) else 0
-                        }
-                        for ask in orderbook['asks']
-                    ]
-            return data
+        if not data or not isinstance(data, list):
+            return {}
         
-        return []
+        result = {}
+        for book in data:
+            token_id = book.get('asset_id') or book.get('token_id')
+            if token_id:
+                result[token_id] = self._parse_orderbook(book)
+        
+        return result
     
-    def get_trades(self, token_id: str, limit: int = 100) -> List[Dict]:
-        """
-        Get recent trades for a token
-        Per docs: https://docs.polymarket.com/developers/CLOB/trades/trades
-        """
-        # Try with token_id param first (per newer docs)
-        data = self._get_clob('/trades', params={'token_id': token_id, 'limit': limit})
-        if data and isinstance(data, list):
-            return data
+    def _parse_orderbook(self, data: Dict) -> Dict:
+        """Parse a single orderbook response"""
+        bids = []
+        asks = []
         
-        # Fallback to 'token' param
-        data = self._get_clob('/trades', params={'token': token_id, 'limit': limit})
-        if data and isinstance(data, list):
-            return data
+        for bid in data.get('bids', []):
+            if isinstance(bid, dict):
+                bids.append({
+                    'price': safe_float(bid.get('price')),
+                    'size': safe_float(bid.get('size'))
+                })
         
-        # Fallback to 'asset_id' param
-        data = self._get_clob('/trades', params={'asset_id': token_id, 'limit': limit})
-        if data and isinstance(data, list):
-            return data
-            
-        return []
+        for ask in data.get('asks', []):
+            if isinstance(ask, dict):
+                asks.append({
+                    'price': safe_float(ask.get('price')),
+                    'size': safe_float(ask.get('size'))
+                })
+        
+        bids.sort(key=lambda x: x['price'], reverse=True)
+        asks.sort(key=lambda x: x['price'])
+        
+        best_bid = bids[0]['price'] if bids else 0
+        best_ask = asks[0]['price'] if asks else 1
+        spread = best_ask - best_bid if best_bid > 0 else 0
+        
+        return {
+            'bids': bids,
+            'asks': asks,
+            'best_bid': best_bid,
+            'best_ask': best_ask,
+            'spread': spread,
+            'spread_percent': (spread / best_bid * 100) if best_bid > 0 else 0
+        }
     
-    def get_price_history(self, token_id: str, interval: str = '1h', fidelity: int = 100) -> List[Dict]:
+    def get_price(self, token_id: str, side: str = 'BUY') -> Optional[float]:
+        """Get current price for a token"""
+        data = self._get_clob('/price', params={'token_id': token_id, 'side': side})
+        if data and isinstance(data, dict):
+            return safe_float(data.get('price'))
+        return None
+    
+    def get_midpoint_price(self, token_id: str) -> Optional[float]:
+        """Get midpoint price for a token"""
+        data = self._get_clob('/midpoint', params={'token_id': token_id})
+        if data and isinstance(data, dict):
+            return safe_float(data.get('mid') or data.get('midpoint') or data.get('price'))
+        return None
+    
+    def get_spread(self, token_id: str) -> Optional[float]:
+        """Get spread for a token"""
+        data = self._get_clob('/spread', params={'token_id': token_id})
+        if data and isinstance(data, dict):
+            return safe_float(data.get('spread'))
+        return None
+    
+    def get_price_history(self, token_id: str, start_ts: Optional[int] = None, 
+                          end_ts: Optional[int] = None, fidelity: int = 60) -> List[Dict]:
         """
         Get price history for a token
-        Per docs: https://docs.polymarket.com/api-reference/pricing/get-price-history-for-a-traded-token
-        
-        Args:
-            token_id: The token ID
-            interval: Time interval ('1m', '5m', '1h', '1d')
-            fidelity: Number of data points (max 1000)
-        
-        Returns:
-            List of {timestamp, price} objects
+        fidelity = number of minutes between data points
         """
-        params = {
-            'token_id': token_id,
-            'interval': interval,
-            'fidelity': min(fidelity, 1000)
-        }
+        import time
         
-        data = self._get_clob('/price-history', params=params)
+        params = {'market': token_id, 'fidelity': fidelity}
+        
+        if start_ts:
+            params['startTs'] = start_ts
+        else:
+            # Default to 7 days ago
+            params['startTs'] = int(time.time()) - (7 * 24 * 60 * 60)
+        
+        if end_ts:
+            params['endTs'] = end_ts
+        
+        data = self._get_clob('/prices-history', params=params)
         
         if not data:
             return []
         
-        # Parse response - could be list or dict with 'history' key
-        history = []
-        if isinstance(data, list):
-            history = data
-        elif isinstance(data, dict):
-            history = data.get('history') or data.get('prices') or data.get('data') or []
+        history = data.get('history', []) if isinstance(data, dict) else data
         
-        # Normalize to consistent format
         result = []
         for item in history:
             if isinstance(item, dict):
                 result.append({
-                    'timestamp': item.get('t') or item.get('timestamp') or item.get('time'),
-                    'price': float(item.get('p') or item.get('price') or item.get('value') or 0)
-                })
-            elif isinstance(item, list) and len(item) >= 2:
-                result.append({
-                    'timestamp': item[0],
-                    'price': float(item[1])
+                    'timestamp': item.get('t'),
+                    'price': safe_float(item.get('p'))
                 })
         
         return result
     
-    def get_price_history_batch(self, token_ids: List[str], interval: str = '1h') -> Dict[str, List[Dict]]:
-        """Get price history for multiple tokens"""
-        result = {}
-        for token_id in token_ids[:20]:  # Limit to prevent rate limiting
-            history = self.get_price_history(token_id, interval=interval)
-            if history:
-                result[token_id] = history
-        return result
+    def get_market_by_id(self, condition_id: str) -> Optional[Dict]:
+        """Get a specific market by condition ID"""
+        data = self._get_gamma(f'/markets/{condition_id}')
+        if data:
+            return self._extract_market_data(data, data)
+        return None
     
-    def get_market_tokens(self, condition_id: str) -> Optional[List[str]]:
-        """
-        Get token IDs for a market condition
-        Returns list of token addresses for YES/NO outcomes
-        Enhanced to check multiple possible locations
-        """
-        # Try to get market details
-        market = self.get_market_by_slug(condition_id)
-        if not market:
-            # Try with condition_id directly
-            market = self._get_gamma(f'/events/{condition_id}')
-        
-        if not market:
-            return None
-        
-        tokens = []
-        
-        def extract_token_id(obj):
-            """Helper to extract token ID from various formats"""
-            if isinstance(obj, str):
-                return obj
-            if isinstance(obj, dict):
-                return (
-                    obj.get('token_id') or 
-                    obj.get('tokenId') or
-                    obj.get('id') or 
-                    obj.get('address') or
-                    obj.get('asset_id') or
-                    obj.get('assetId')
-                )
-            return None
-        
-        if isinstance(market, dict):
-            # Check for tokens array (most common)
-            if 'tokens' in market:
-                for token in market['tokens']:
-                    token_id = extract_token_id(token)
-                    if token_id:
-                        tokens.append(str(token_id))
-            
-            # Check for outcomes array
-            if 'outcomes' in market:
-                for outcome in market['outcomes']:
-                    token_id = extract_token_id(outcome)
-                    if token_id:
-                        tokens.append(str(token_id))
-            
-            # Check for asset_id (single token markets)
-            if 'asset_id' in market or 'assetId' in market:
-                asset_id = market.get('asset_id') or market.get('assetId')
-                if asset_id:
-                    tokens.append(str(asset_id))
-            
-            # Check raw_data if present
-            if 'raw_data' in market and isinstance(market['raw_data'], dict):
-                raw = market['raw_data']
-                if 'tokens' in raw:
-                    for token in raw['tokens']:
-                        token_id = extract_token_id(token)
-                        if token_id:
-                            tokens.append(str(token_id))
-                if 'outcomes' in raw:
-                    for outcome in raw['outcomes']:
-                        token_id = extract_token_id(outcome)
-                        if token_id:
-                            tokens.append(str(token_id))
-            
-            # Check event nested structure
-            if 'event' in market and isinstance(market['event'], dict):
-                event = market['event']
-                if 'tokens' in event:
-                    for token in event['tokens']:
-                        token_id = extract_token_id(token)
-                        if token_id:
-                            tokens.append(str(token_id))
-        
-        # Remove duplicates and return
-        unique_tokens = list(set(tokens))
-        return unique_tokens if unique_tokens else None
+    def get_market_by_slug(self, slug: str) -> Optional[Dict]:
+        """Get a specific market by slug"""
+        data = self._get_gamma(f'/events/{slug}')
+        if data:
+            return self._extract_market_data(data, data)
+        return None
     
-    def get_market_details(self, condition_id: str) -> Optional[Dict]:
-        """Get full market details including tokens and prices"""
-        market = self.get_market_by_slug(condition_id)
-        if not market:
-            market = self._get_gamma(f'/events/{condition_id}')
+    def get_neg_risk_groups(self, markets: List[Dict]) -> Dict[str, List[Dict]]:
+        """
+        Group markets by their negative risk market ID
+        This is KEY for finding arbitrage opportunities
+        """
+        groups = {}
         
-        if market:
-            # Get prices
-            prices = self.get_market_prices(condition_id)
-            if prices:
-                market['prices'] = prices
-            
-            # Get tokens
-            tokens = self.get_market_tokens(condition_id)
-            if tokens:
-                market['token_ids'] = tokens
+        for market in markets:
+            if market.get('neg_risk') and market.get('neg_risk_market_id'):
+                group_id = market['neg_risk_market_id']
+                if group_id not in groups:
+                    groups[group_id] = []
+                groups[group_id].append(market)
         
-        return market
+        # Only return groups with 2+ markets (where arb is possible)
+        return {k: v for k, v in groups.items() if len(v) >= 2}

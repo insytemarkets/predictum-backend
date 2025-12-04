@@ -1,10 +1,11 @@
 """
-Market Scanner Worker
-Fetches markets from Polymarket GAMMA API and stores in Supabase
+Market Scanner v2.0
+Fetches ALL the rich market data from Polymarket and stores it
 """
-import time
 import logging
-from typing import Optional, List, Dict
+import time
+from typing import Dict, List, Any
+
 from services.polymarket_api import PolymarketAPI
 from services.supabase_client import SupabaseClient
 
@@ -14,270 +15,175 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 class MarketScanner:
+    """
+    Scans Polymarket for markets and stores rich data
+    """
+    
     def __init__(self):
         self.api = PolymarketAPI()
         self.db = SupabaseClient()
-        self.scan_interval = 30  # seconds
+        self.scan_interval = 60  # seconds
     
-    def scan_markets(self):
-        """Fetch and store markets with token IDs and initial prices"""
+    def scan_markets(self) -> int:
+        """
+        Scan all active markets and store rich data
+        Returns number of markets processed
+        """
+        logger.info("Starting market scan with rich data extraction...")
+        
         try:
-            logger.info("Starting market scan...")
-            markets = self.api.get_markets(limit=200, active=True, closed=False)
+            # Fetch markets with ALL the data
+            markets = self.api.get_markets(limit=500)
             
             if not markets:
                 logger.warning("No markets returned from API")
-                return
+                return 0
             
-            logger.info(f"Fetched {len(markets)} markets")
+            logger.info(f"Fetched {len(markets)} markets with rich data")
             
+            # Process and store each market
             stored_count = 0
-            all_token_ids = []
+            neg_risk_count = 0
+            high_volume_count = 0
             
             for market in markets:
                 try:
-                    # Transform market data
-                    processed = self._process_market(market)
-                    if processed:
-                        condition_id = processed.get('condition_id')
-                        if condition_id:
-                            # Extract tokens directly from market data first
-                            tokens = self._extract_tokens_from_market(market)
-                            
-                            # If not found, try API call
-                            if not tokens:
-                                tokens = self.api.get_market_tokens(condition_id)
-                            
-                            if tokens:
-                                processed['tokens'] = tokens
-                                all_token_ids.extend(tokens)
-                                
-                                # Store tokens in raw_data for later use
-                                if isinstance(processed.get('raw_data'), dict):
-                                    processed['raw_data']['stored_tokens'] = tokens
-                            
-                            result = self.db.upsert_market(processed)
-                            if result:
-                                stored_count += 1
-                                
-                                # Fetch and store initial prices for tokens
-                                if tokens:
-                                    self._fetch_and_store_prices(condition_id, tokens)
-                            
+                    # Transform to DB schema
+                    db_market = self._transform_market(market)
+                    
+                    if db_market:
+                        self.db.upsert_market(db_market)
+                        stored_count += 1
+                        
+                        # Track interesting markets
+                        if market.get('neg_risk'):
+                            neg_risk_count += 1
+                        if market.get('volume_24h', 0) > 100000:
+                            high_volume_count += 1
+                
                 except Exception as e:
-                    logger.error(f"Error processing market {market.get('id', 'unknown')}: {e}", exc_info=True)
-                    continue
+                    logger.error(f"Error storing market {market.get('condition_id')}: {e}")
             
-            logger.info(f"Stored {stored_count} markets with {len(set(all_token_ids))} unique tokens")
+            logger.info(f"Stored {stored_count} markets")
+            logger.info(f"  - {neg_risk_count} with negative risk (arb potential)")
+            logger.info(f"  - {high_volume_count} with >$100K 24h volume")
+            
+            # Log top movers
+            self._log_top_movers(markets)
+            
+            return stored_count
             
         except Exception as e:
             logger.error(f"Error in market scan: {e}", exc_info=True)
+            return 0
     
-    def _extract_tokens_from_market(self, market: dict) -> List[str]:
-        """Extract token IDs directly from market data structure"""
-        import json
-        tokens = []
-        
-        if not isinstance(market, dict):
-            return tokens
-        
-        def parse_token_ids(clob_ids):
-            """Parse clobTokenIds which can be a list or a JSON string"""
-            if isinstance(clob_ids, list):
-                return [str(t) for t in clob_ids if t]
-            elif isinstance(clob_ids, str):
-                # It might be a JSON string like "[\"token1\", \"token2\"]"
-                try:
-                    parsed = json.loads(clob_ids)
-                    if isinstance(parsed, list):
-                        return [str(t) for t in parsed if t]
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            return []
-        
-        # PRIORITY: Check for clobTokenIds (GAMMA API format)
-        # This is the primary field for token IDs in the GAMMA API response
-        if 'clobTokenIds' in market:
-            tokens = parse_token_ids(market['clobTokenIds'])
-            if tokens:
-                logger.debug(f"Found {len(tokens)} tokens in clobTokenIds")
-                return list(set(tokens))
-        
-        # Also check raw_data for clobTokenIds
-        raw_data = market.get('raw_data', {})
-        if isinstance(raw_data, dict) and 'clobTokenIds' in raw_data:
-            tokens = parse_token_ids(raw_data['clobTokenIds'])
-            if tokens:
-                logger.debug(f"Found {len(tokens)} tokens in raw_data.clobTokenIds")
-                return list(set(tokens))
-        
-        # Check for tokens array in various locations
-        if 'tokens' in market and isinstance(market['tokens'], list):
-            for token in market['tokens']:
-                if isinstance(token, dict):
-                    # Try various token ID fields
-                    token_id = (
-                        token.get('token_id') or 
-                        token.get('tokenId') or
-                        token.get('id') or 
-                        token.get('address') or
-                        token.get('asset_id') or
-                        token.get('assetId')
-                    )
-                    if token_id:
-                        tokens.append(str(token_id))
-                elif isinstance(token, str):
-                    tokens.append(token)
-        
-        # Check outcomes array
-        if 'outcomes' in market and isinstance(market['outcomes'], list):
-            for outcome in market['outcomes']:
-                if isinstance(outcome, dict):
-                    token_id = (
-                        outcome.get('token_id') or 
-                        outcome.get('tokenId') or
-                        outcome.get('id') or 
-                        outcome.get('address') or
-                        outcome.get('asset_id')
-                    )
-                    if token_id:
-                        tokens.append(str(token_id))
-        
-        # Check tokenIds array
-        if 'tokenIds' in market and isinstance(market['tokenIds'], list):
-            for token_id in market['tokenIds']:
-                if token_id:
-                    tokens.append(str(token_id))
-        
-        # Check event nested structure
-        if 'event' in market and isinstance(market['event'], dict):
-            event = market['event']
-            if 'tokens' in event:
-                for token in event['tokens']:
-                    if isinstance(token, dict):
-                        token_id = token.get('token_id') or token.get('id')
-                        if token_id:
-                            tokens.append(str(token_id))
-                    elif isinstance(token, str):
-                        tokens.append(token)
-        
-        return list(set(tokens))  # Remove duplicates
-    
-    def _fetch_and_store_prices(self, condition_id: str, tokens: List[str]):
-        """Fetch current prices for tokens and store in prices table"""
-        try:
-            if not tokens:
-                return
-                
-            # Fetch prices in batch
-            prices = self.api.get_prices_batch(tokens)
-            
-            if prices:
-                # Store prices with outcome_index (0=YES, 1=NO typically)
-                for idx, token_id in enumerate(tokens):
-                    if token_id in prices:
-                        price = prices[token_id]
-                        self.db.insert_price(condition_id, idx, price)
-            
-        except Exception as e:
-            logger.error(f"Error fetching/storing prices for {condition_id}: {e}", exc_info=True)
-    
-    def _process_market(self, market: dict) -> Optional[dict]:
-        """Process raw market data into our schema"""
-        try:
-            # Extract condition_id (try multiple possible fields)
-            condition_id = (
-                market.get('conditionId') or
-                market.get('condition_id') or 
-                market.get('id') or 
-                market.get('event', {}).get('conditionId') or
-                market.get('event', {}).get('condition_id')
-            )
-            
-            if not condition_id:
-                logger.warning(f"Market missing condition_id: {market.keys()}")
-                return None
-            
-            # Extract question
-            question = (
-                market.get('question') or 
-                market.get('title') or
-                market.get('event', {}).get('question', '') or
-                market.get('name', '')
-            )
-            
-            if not question:
-                question = f"Market {condition_id}"
-            
-            # Extract slug
-            slug = (
-                market.get('slug') or 
-                market.get('event', {}).get('slug') or
-                market.get('id') or
-                condition_id
-            )
-            
-            # Extract volume and liquidity (try multiple field names)
-            volume_24h = float(
-                market.get('volume24hr') or
-                market.get('volume_24h') or
-                market.get('volume24h') or
-                market.get('volume') or
-                market.get('volumeUSD') or
-                0
-            )
-            
-            liquidity = float(
-                market.get('liquidity') or
-                market.get('liquidityUSD') or
-                market.get('totalLiquidity') or
-                0
-            )
-            
-            # Extract end date (try multiple formats)
-            end_date = (
-                market.get('endDate') or
-                market.get('end_date') or
-                market.get('end_date_iso') or
-                market.get('endDateISO') or
-                market.get('event', {}).get('endDate') or
-                market.get('event', {}).get('end_date_iso')
-            )
-            
-            # Extract additional useful data
-            tokens = market.get('tokens') or market.get('tokenIds') or []
-            outcomes = market.get('outcomes') or []
-            
-            # Store tokens in raw_data for later extraction
-            market_data = {
-                'condition_id': str(condition_id),
-                'question': str(question),
-                'slug': str(slug),
-                'url': f"https://polymarket.com/event/{slug}",
-                'end_date': end_date,
-                'volume_24h': volume_24h,
-                'liquidity': liquidity,
-                'raw_data': market
-            }
-            
-            # Tokens will be added in scan_markets() after fetching
-            return market_data
-        except Exception as e:
-            logger.error(f"Error processing market: {e}", exc_info=True)
+    def _transform_market(self, market: Dict) -> Dict:
+        """Transform API market data to DB schema"""
+        condition_id = market.get('condition_id')
+        if not condition_id:
             return None
+        
+        # Extract token IDs as JSON string for storage
+        clob_tokens = market.get('clob_token_ids', [])
+        tokens_json = clob_tokens if isinstance(clob_tokens, list) else []
+        
+        return {
+            'condition_id': condition_id,
+            'question': market.get('question', ''),
+            'slug': market.get('slug', ''),
+            'description': market.get('description', ''),
+            
+            # Volume metrics
+            'volume_24h': market.get('volume_24h', 0),
+            'volume_7d': market.get('volume_7d', 0),
+            'volume_30d': market.get('volume_30d', 0),
+            'volume_velocity': market.get('volume_velocity', 1.0),
+            'liquidity': market.get('liquidity', 0),
+            
+            # Price data
+            'current_price': market.get('current_price', 0.5),
+            'price_change_24h': market.get('price_change_24h', 0),
+            'price_change_7d': market.get('price_change_7d', 0),
+            'price_change_30d': market.get('price_change_30d', 0),
+            'last_trade_price': market.get('last_trade_price'),
+            
+            # Orderbook data
+            'best_bid': market.get('best_bid'),
+            'best_ask': market.get('best_ask'),
+            'spread': market.get('spread', 0),
+            
+            # Alpha signals
+            'neg_risk': market.get('neg_risk', False),
+            'neg_risk_market_id': market.get('neg_risk_market_id'),
+            'competitive_score': market.get('competitive_score', 0),
+            'accepting_orders': market.get('accepting_orders', True),
+            
+            # Rewards
+            'has_rewards': market.get('has_rewards', False),
+            'rewards_daily_rate': market.get('rewards_daily_rate', 0),
+            'rewards_min_size': market.get('rewards_min_size'),
+            'rewards_max_spread': market.get('rewards_max_spread'),
+            
+            # Metadata
+            'category': market.get('category', ''),
+            'image_url': market.get('image_url', ''),
+            'end_date': market.get('end_date'),
+            'active': market.get('active', True),
+            'closed': market.get('closed', False),
+            
+            # Token data
+            'tokens': tokens_json,
+            'outcomes': market.get('outcomes', []),
+            'outcome_prices': market.get('outcome_prices', []),
+            
+            # Raw data for debugging
+            'raw_data': market.get('raw_data', {})
+        }
+    
+    def _log_top_movers(self, markets: List[Dict]):
+        """Log the top movers for monitoring"""
+        # Top by 24h price change
+        by_change = sorted(
+            [m for m in markets if m.get('price_change_24h')],
+            key=lambda x: abs(x.get('price_change_24h', 0)),
+            reverse=True
+        )[:5]
+        
+        if by_change:
+            logger.info("Top 24h movers:")
+            for m in by_change:
+                change = m.get('price_change_24h', 0) * 100
+                logger.info(f"  {change:+.1f}% | {m.get('question', '')[:50]}")
+        
+        # Top by volume velocity
+        by_velocity = sorted(
+            [m for m in markets if m.get('volume_velocity', 1) > 2],
+            key=lambda x: x.get('volume_velocity', 1),
+            reverse=True
+        )[:5]
+        
+        if by_velocity:
+            logger.info("High volume velocity (>2x normal):")
+            for m in by_velocity:
+                vel = m.get('volume_velocity', 1)
+                logger.info(f"  {vel:.1f}x | {m.get('question', '')[:50]}")
     
     def run(self):
         """Main worker loop"""
-        logger.info("Market Scanner Worker started")
+        logger.info("Market Scanner v2.0 started")
+        
         while True:
             try:
-                self.scan_markets()
+                count = self.scan_markets()
+                logger.info(f"Scan complete: {count} markets processed")
             except Exception as e:
-                logger.error(f"Fatal error in market scanner: {e}", exc_info=True)
+                logger.error(f"Fatal error in scan: {e}", exc_info=True)
             
-            logger.info(f"Sleeping for {self.scan_interval} seconds...")
+            logger.info(f"Sleeping {self.scan_interval}s...")
             time.sleep(self.scan_interval)
+
 
 if __name__ == "__main__":
     scanner = MarketScanner()

@@ -559,3 +559,17 @@ class PolymarketAPI:
                 groups[group_id].append(market)
         
         return {k: v for k, v in groups.items() if len(v) >= 2}
+    
+    def get_market_tokens(self, condition_id: str) -> List[str]:
+        """
+        Get CLOB token IDs for a specific market
+        Fallback method when tokens aren't cached
+        """
+        data = self._get_gamma(f'/markets/{condition_id}')
+        if not data:
+            return []
+        
+        clob_tokens = parse_json_field(data.get('clobTokenIds', []))
+        if isinstance(clob_tokens, list):
+            return [str(t) for t in clob_tokens if t]
+        return []

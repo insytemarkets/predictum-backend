@@ -74,22 +74,23 @@ class OrderBookScanner:
                 if tokens:
                     token_to_market[tokens[0]] = condition_id
             
-            # Process batch results - match by index since order should match
-            for idx, orderbook in enumerate(orderbooks):
+            # Process batch results - orderbooks is a dict {token_id: orderbook_data}
+            for token_id, orderbook in orderbooks.items():
                 try:
-                    # Match orderbook to market by index (order should match)
-                    if idx < len(all_tokens):
-                        token_id = all_tokens[idx]
-                        condition_id = token_to_market.get(token_id)
-                        
-                        # Fallback: try matching by asset_id or market field
-                        if not condition_id:
-                            asset_id = orderbook.get('asset_id')
-                            market_id = orderbook.get('market')
-                            for tid, cid in token_to_market.items():
-                                if str(tid) == str(asset_id) or str(tid) == str(market_id):
-                                    condition_id = cid
-                                    break
+                    if not isinstance(orderbook, dict):
+                        logger.debug(f"Skipping non-dict orderbook for {token_id}")
+                        continue
+                    
+                    # Find the market for this token
+                    condition_id = token_to_market.get(token_id)
+                    
+                    # Fallback: try matching by asset_id or market field
+                    if not condition_id:
+                        asset_id = orderbook.get('asset_id') or orderbook.get('token_id')
+                        for tid, cid in token_to_market.items():
+                            if str(tid) == str(asset_id) or str(tid) == str(token_id):
+                                condition_id = cid
+                                break
                     
                     if not condition_id:
                         continue
@@ -108,7 +109,7 @@ class OrderBookScanner:
                         scanned_count += 1
                         
                 except Exception as e:
-                    logger.error(f"Error processing batch orderbook: {e}")
+                    logger.error(f"Error processing orderbook for {token_id}: {e}")
                     continue
             
             logger.info(f"Scanned {scanned_count} order books")

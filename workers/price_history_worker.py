@@ -98,7 +98,20 @@ class PriceHistoryWorker:
                     token_prices = {}
                     for token in tokens:
                         if token in current_prices:
-                            token_prices[token] = current_prices[token]
+                            price_data = current_prices[token]
+                            # Handle dict format {buy: x, sell: y, mid: z}
+                            if isinstance(price_data, dict):
+                                # Use mid price, or average of buy/sell
+                                if 'mid' in price_data:
+                                    token_prices[token] = float(price_data['mid'])
+                                elif 'buy' in price_data and 'sell' in price_data:
+                                    token_prices[token] = (float(price_data['buy']) + float(price_data['sell'])) / 2
+                                elif 'buy' in price_data:
+                                    token_prices[token] = float(price_data['buy'])
+                                else:
+                                    token_prices[token] = 0.5
+                            else:
+                                token_prices[token] = float(price_data) if price_data else 0.5
                     
                     if not token_prices:
                         continue
@@ -106,10 +119,12 @@ class PriceHistoryWorker:
                     # Store current prices
                     for idx, token in enumerate(tokens):
                         if token in token_prices:
-                            self.db.insert_price(condition_id, idx, token_prices[token])
+                            price_val = token_prices[token]
+                            if isinstance(price_val, (int, float)):
+                                self.db.insert_price(condition_id, idx, price_val)
                     
                     # Calculate price changes
-                    current_price = token_prices.get(tokens[0], 0) if tokens else 0  # Use YES token
+                    current_price = token_prices.get(tokens[0], 0.5) if tokens else 0.5  # Use YES token
                     
                     # Get price from 24h ago
                     price_24h_ago = None
@@ -135,22 +150,17 @@ class PriceHistoryWorker:
                                 continue
                     
                     # Calculate change
-                    price_change_24h = None
-                    price_change_percent = None
+                    price_change_24h = 0
                     
-                    if price_24h_ago and current_price:
-                        price_change_24h = current_price - price_24h_ago
-                        if price_24h_ago > 0:
-                            price_change_percent = (price_change_24h / price_24h_ago) * 100
+                    if price_24h_ago and current_price and price_24h_ago > 0:
+                        price_change_24h = (current_price - price_24h_ago) / price_24h_ago
                     
-                    # Update market with price info
-                    update_data = {
+                    # Update market with current_price directly using upsert_market
+                    self.db.upsert_market({
                         'condition_id': condition_id,
                         'current_price': current_price,
-                        'price_change_24h': price_change_24h,
-                        'price_change_percent': price_change_percent
-                    }
-                    self.db.update_market_prices(condition_id, update_data)
+                        'price_change_24h': price_change_24h
+                    })
                     
                     updated_count += 1
                     

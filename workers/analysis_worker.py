@@ -45,7 +45,7 @@ class AnalysisWorker:
         logger.info("Analysis Worker started (Opportunities + Stats + Signals)")
         
         # Run initial scans
-        self.opportunity_detector.detect_opportunities()
+        self.opportunity_detector.detect_all()
         self.last_opportunity_scan = time.time()
         
         self.stats_aggregator.aggregate_stats()
@@ -65,7 +65,7 @@ class AnalysisWorker:
                 
                 # Check if it's time to detect opportunities (every 60s)
                 if current_time - self.last_opportunity_scan >= self.opportunity_interval:
-                    self.opportunity_detector.detect_opportunities()
+                    self.opportunity_detector.detect_all()
                     self.last_opportunity_scan = time.time()
                 
                 # Check if it's time to aggregate stats (every 5 min)

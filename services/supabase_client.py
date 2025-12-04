@@ -660,3 +660,140 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error getting performance stats: {e}")
             return {'total': 0, 'profitable': 0, 'accuracy': 0, 'avg_profit': 0}
+    
+    # ============================================
+    # PRICE CHANGE TRACKING
+    # ============================================
+    
+    def update_market_prices(self, condition_id: str, price_data: Dict) -> Optional[Dict]:
+        """Update market with current price and price change data"""
+        try:
+            update_data = {}
+            
+            if 'current_price' in price_data and price_data['current_price'] is not None:
+                update_data['current_price'] = float(price_data['current_price'])
+            
+            if 'price_change_24h' in price_data and price_data['price_change_24h'] is not None:
+                update_data['price_change_24h'] = float(price_data['price_change_24h'])
+            
+            if 'price_change_percent' in price_data and price_data['price_change_percent'] is not None:
+                update_data['price_change_percent'] = float(price_data['price_change_percent'])
+            
+            if 'price_change_1h' in price_data and price_data['price_change_1h'] is not None:
+                update_data['price_change_1h'] = float(price_data['price_change_1h'])
+            
+            if 'price_change_7d' in price_data and price_data['price_change_7d'] is not None:
+                update_data['price_change_7d'] = float(price_data['price_change_7d'])
+            
+            if 'momentum' in price_data and price_data['momentum'] is not None:
+                update_data['momentum'] = float(price_data['momentum'])
+            
+            if 'volatility_24h' in price_data and price_data['volatility_24h'] is not None:
+                update_data['volatility_24h'] = float(price_data['volatility_24h'])
+            
+            if not update_data:
+                return None
+            
+            result = self.client.table('markets').update(update_data).eq('condition_id', condition_id).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logger.error(f"Error updating market prices: {e}")
+            return None
+    
+    # ============================================
+    # MONEY FLOW TRACKING
+    # ============================================
+    
+    def insert_money_flow(self, flow_data: Dict) -> Optional[Dict]:
+        """Insert money flow snapshot"""
+        try:
+            market_id = flow_data.get('market_id')
+            market_uuid = None
+            
+            if market_id:
+                market = self.client.table('markets').select('id').eq('condition_id', market_id).execute()
+                if market.data:
+                    market_uuid = market.data[0]['id']
+            
+            data = {
+                'market_id': market_uuid,
+                'net_flow': float(flow_data.get('net_flow', 0)),
+                'buy_volume': float(flow_data.get('buy_volume', 0)),
+                'sell_volume': float(flow_data.get('sell_volume', 0)),
+                'flow_velocity': float(flow_data.get('flow_velocity', 0)),
+                'period': str(flow_data.get('period', '1h'))
+            }
+            
+            result = self.client.table('money_flow').insert(data).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logger.error(f"Error inserting money flow: {e}")
+            return None
+    
+    def get_money_flow(self, market_id: str = None, period: str = '24h', limit: int = 100) -> List[Dict]:
+        """Get money flow data"""
+        try:
+            query = self.client.table('money_flow').select('*, markets(*)')
+            
+            if market_id:
+                market = self.client.table('markets').select('id').eq('condition_id', market_id).execute()
+                if market.data:
+                    query = query.eq('market_id', market.data[0]['id'])
+            
+            if period:
+                query = query.eq('period', period)
+            
+            result = query.order('timestamp', desc=True).limit(limit).execute()
+            return result.data if result.data else []
+        except Exception as e:
+            logger.error(f"Error getting money flow: {e}")
+            return []
+    
+    # ============================================
+    # ORDER BOOK INTELLIGENCE
+    # ============================================
+    
+    def insert_orderbook_snapshot(self, snapshot_data: Dict) -> Optional[Dict]:
+        """Insert order book snapshot with depth analysis"""
+        try:
+            market_id = snapshot_data.get('market_id')
+            market_uuid = None
+            
+            if market_id:
+                market = self.client.table('markets').select('id').eq('condition_id', market_id).execute()
+                if market.data:
+                    market_uuid = market.data[0]['id']
+            
+            data = {
+                'market_id': market_uuid,
+                'bid_depth_10': float(snapshot_data.get('bid_depth_10', 0)),
+                'ask_depth_10': float(snapshot_data.get('ask_depth_10', 0)),
+                'spread': float(snapshot_data.get('spread', 0)),
+                'imbalance': float(snapshot_data.get('imbalance', 0)),
+                'best_bid': float(snapshot_data.get('best_bid', 0)),
+                'best_ask': float(snapshot_data.get('best_ask', 0))
+            }
+            
+            result = self.client.table('orderbook_snapshots').insert(data).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logger.error(f"Error inserting orderbook snapshot: {e}")
+            return None
+    
+    def get_orderbook_snapshots(self, market_id: str, limit: int = 100) -> List[Dict]:
+        """Get order book snapshots for analysis"""
+        try:
+            market = self.client.table('markets').select('id').eq('condition_id', market_id).execute()
+            if not market.data:
+                return []
+            
+            result = self.client.table('orderbook_snapshots')\
+                .select('*')\
+                .eq('market_id', market.data[0]['id'])\
+                .order('timestamp', desc=True)\
+                .limit(limit)\
+                .execute()
+            return result.data if result.data else []
+        except Exception as e:
+            logger.error(f"Error getting orderbook snapshots: {e}")
+            return []

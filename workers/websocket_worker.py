@@ -1,6 +1,7 @@
 """
-WebSocket Worker for Real-Time Polymarket Data
+WebSocket Worker for Real-Time Polymarket Data - Wolf Pack Edition
 Connects to Polymarket WebSocket for live order book, price, and trade updates
+Includes order book intelligence: depth analysis, imbalance detection, spread dynamics
 Per docs: https://docs.polymarket.com/developers/CLOB/websocket/market-channel
 """
 import asyncio
@@ -35,11 +36,21 @@ logger = logging.getLogger(__name__)
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
-# Whale detection threshold (in USDC)
+# Intelligence thresholds
 WHALE_THRESHOLD = 10000  # $10,000+ trades are whales
+IMBALANCE_ALERT_THRESHOLD = 0.6  # 60% imbalance triggers alert
+SPREAD_ALERT_THRESHOLD = 0.05  # 5% spread change triggers alert
+PRICE_CHANGE_ALERT = 0.02  # 2% price change triggers alert
+
 
 class WebSocketWorker:
-    """Real-time WebSocket connection to Polymarket"""
+    """
+    Wolf Pack Real-Time Intelligence
+    - Live order book updates with depth analysis
+    - Real-time price tracking with significant move detection
+    - Whale trade detection and tracking
+    - Order book imbalance and spread dynamics
+    """
     
     def __init__(self):
         self.db = SupabaseClient()
@@ -48,7 +59,9 @@ class WebSocketWorker:
         self.max_reconnect_delay = 60
         self.running = True
         self.last_prices: Dict[str, float] = {}
+        self.last_spreads: Dict[str, float] = {}
         self.connection = None
+        self.token_to_market: Dict[str, str] = {}  # Cache token -> market mapping
         
     async def get_top_market_tokens(self, limit: int = 100) -> List[str]:
         """Get token IDs for top markets by volume"""
@@ -57,7 +70,7 @@ class WebSocketWorker:
             tokens = []
             
             for market in markets:
-                # Extract tokens from raw_data
+                condition_id = market.get('condition_id')
                 raw_data = market.get('raw_data', {})
                 
                 # Try clobTokenIds first
@@ -69,13 +82,19 @@ class WebSocketWorker:
                         clob_tokens = []
                 
                 if clob_tokens:
-                    tokens.extend(clob_tokens)
+                    for token in clob_tokens:
+                        tokens.append(token)
+                        if condition_id:
+                            self.token_to_market[token] = condition_id
                     continue
                 
                 # Try stored_tokens
                 stored_tokens = raw_data.get('stored_tokens', [])
                 if stored_tokens:
-                    tokens.extend(stored_tokens)
+                    for token in stored_tokens:
+                        tokens.append(token)
+                        if condition_id:
+                            self.token_to_market[token] = condition_id
                     continue
                 
                 # Try tokens field
@@ -87,7 +106,10 @@ class WebSocketWorker:
                         market_tokens = []
                 
                 if market_tokens:
-                    tokens.extend(market_tokens)
+                    for token in market_tokens:
+                        tokens.append(token)
+                        if condition_id:
+                            self.token_to_market[token] = condition_id
             
             # Remove duplicates and empty strings
             unique_tokens = list(set([t for t in tokens if t and isinstance(t, str)]))
@@ -99,11 +121,17 @@ class WebSocketWorker:
             return []
     
     def _get_market_id_for_token(self, token_id: str) -> Optional[str]:
-        """Get market condition_id for a token"""
+        """Get market condition_id for a token (uses cache)"""
+        # Check cache first
+        if token_id in self.token_to_market:
+            return self.token_to_market[token_id]
+        
         try:
             markets = self.db.get_markets(limit=500)
             for market in markets:
+                condition_id = market.get('condition_id')
                 raw_data = market.get('raw_data', {})
+                
                 clob_tokens = raw_data.get('clobTokenIds', [])
                 if isinstance(clob_tokens, str):
                     try:
@@ -112,11 +140,13 @@ class WebSocketWorker:
                         clob_tokens = []
                 
                 if token_id in clob_tokens:
-                    return market.get('condition_id')
+                    self.token_to_market[token_id] = condition_id
+                    return condition_id
                 
                 stored_tokens = raw_data.get('stored_tokens', [])
                 if token_id in stored_tokens:
-                    return market.get('condition_id')
+                    self.token_to_market[token_id] = condition_id
+                    return condition_id
             
             return None
         except Exception as e:
@@ -124,7 +154,7 @@ class WebSocketWorker:
             return None
     
     async def handle_price_change(self, data: Dict):
-        """Handle price change event"""
+        """Handle price change event with significant move detection"""
         try:
             token_id = data.get('asset_id') or data.get('token_id')
             price = data.get('price')
@@ -139,22 +169,39 @@ class WebSocketWorker:
                 old_price = self.last_prices[token_id]
                 if old_price > 0:
                     change_pct = ((price - old_price) / old_price) * 100
-                    if abs(change_pct) > 2.0:  # 2% change
-                        logger.info(f"Significant price change: {token_id} {old_price:.4f} -> {price:.4f} ({change_pct:+.2f}%)")
+                    
+                    if abs(change_pct) > PRICE_CHANGE_ALERT * 100:
+                        direction = "📈" if change_pct > 0 else "📉"
+                        logger.info(f"{direction} Price Move: {token_id[:16]}... {old_price:.4f} -> {price:.4f} ({change_pct:+.2f}%)")
+                        
+                        # Find market and create signal
+                        market_id = self._get_market_id_for_token(token_id)
+                        if market_id:
+                            self.db.insert_signal({
+                                'market_id': market_id,
+                                'type': 'price_move',
+                                'title': f"Price {'Surge' if change_pct > 0 else 'Drop'} Detected",
+                                'description': f"Real-time price moved {change_pct:+.2f}%",
+                                'severity': 'high' if abs(change_pct) > 5 else 'medium',
+                                'data': {
+                                    'old_price': old_price,
+                                    'new_price': price,
+                                    'change_percent': change_pct
+                                }
+                            })
             
             self.last_prices[token_id] = price
             
             # Find market and update price
             market_id = self._get_market_id_for_token(token_id)
             if market_id:
-                # Insert price record
                 self.db.insert_price(market_id, 0, price)
                 
         except Exception as e:
             logger.error(f"Error handling price change: {e}")
     
     async def handle_trade(self, data: Dict):
-        """Handle trade event - detect whales"""
+        """Handle trade event - detect whales and track flow"""
         try:
             token_id = data.get('asset_id') or data.get('token_id')
             price = float(data.get('price', 0))
@@ -169,7 +216,8 @@ class WebSocketWorker:
             is_whale = trade_value >= WHALE_THRESHOLD
             
             if is_whale:
-                logger.info(f"🐋 WHALE TRADE: {side} ${trade_value:,.2f} on {token_id}")
+                direction = "🟢" if side == 'BUY' else "🔴"
+                logger.info(f"🐋 WHALE TRADE: {direction} {side} ${trade_value:,.2f} on {token_id[:16]}...")
             
             # Find market
             market_id = self._get_market_id_for_token(token_id)
@@ -189,11 +237,29 @@ class WebSocketWorker:
                 'is_whale': is_whale
             })
             
+            # Create whale signal
+            if is_whale:
+                self.db.insert_signal({
+                    'market_id': market_id,
+                    'type': 'whale_trade',
+                    'title': f"Whale {side} Detected",
+                    'description': f"${trade_value:,.0f} {side.lower()} executed",
+                    'severity': 'high',
+                    'data': {
+                        'price': price,
+                        'size': size,
+                        'value': trade_value,
+                        'side': side,
+                        'maker': maker[:20] if maker else '',
+                        'taker': taker[:20] if taker else ''
+                    }
+                })
+            
         except Exception as e:
             logger.error(f"Error handling trade: {e}")
     
     async def handle_book_update(self, data: Dict):
-        """Handle order book update"""
+        """Handle order book update with depth/imbalance analysis"""
         try:
             token_id = data.get('asset_id') or data.get('token_id')
             bids = data.get('bids', [])
@@ -235,8 +301,66 @@ class WebSocketWorker:
                     })
             
             # Update order book in database
-            if parsed_bids or parsed_asks:
-                self.db.insert_orderbook(market_id, parsed_bids, parsed_asks)
+            if not parsed_bids and not parsed_asks:
+                return
+            
+            self.db.insert_orderbook(market_id, parsed_bids, parsed_asks)
+            
+            # Calculate order book intelligence
+            best_bid = parsed_bids[0]['price'] if parsed_bids else 0
+            best_ask = parsed_asks[0]['price'] if parsed_asks else 0
+            spread = best_ask - best_bid if best_ask and best_bid else 0
+            
+            # Calculate depth within 10% of midpoint
+            midpoint = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+            bid_depth_10 = sum(b['size'] * b['price'] for b in parsed_bids 
+                               if b['price'] >= midpoint * 0.9) if midpoint else 0
+            ask_depth_10 = sum(a['size'] * a['price'] for a in parsed_asks 
+                               if a['price'] <= midpoint * 1.1) if midpoint else 0
+            
+            # Calculate imbalance
+            total_depth = bid_depth_10 + ask_depth_10
+            imbalance = (bid_depth_10 - ask_depth_10) / total_depth if total_depth > 0 else 0
+            
+            # Store snapshot for intelligence
+            self.db.insert_orderbook_snapshot({
+                'market_id': market_id,
+                'bid_depth_10': bid_depth_10,
+                'ask_depth_10': ask_depth_10,
+                'spread': spread,
+                'imbalance': imbalance,
+                'best_bid': best_bid,
+                'best_ask': best_ask
+            })
+            
+            # Alert on significant imbalance
+            if abs(imbalance) > IMBALANCE_ALERT_THRESHOLD:
+                direction = "BULLISH" if imbalance > 0 else "BEARISH"
+                logger.info(f"📊 Order Book Imbalance: {direction} {imbalance:.2f} on {token_id[:16]}...")
+                
+                self.db.insert_signal({
+                    'market_id': market_id,
+                    'type': 'orderbook_imbalance',
+                    'title': f"Strong {direction} Order Book",
+                    'description': f"Order book shows {abs(imbalance)*100:.0f}% {direction.lower()} imbalance",
+                    'severity': 'medium',
+                    'data': {
+                        'imbalance': imbalance,
+                        'bid_depth': bid_depth_10,
+                        'ask_depth': ask_depth_10,
+                        'spread': spread
+                    }
+                })
+            
+            # Check for spread changes
+            if token_id in self.last_spreads and spread > 0:
+                old_spread = self.last_spreads[token_id]
+                if old_spread > 0:
+                    spread_change = (spread - old_spread) / old_spread
+                    if abs(spread_change) > SPREAD_ALERT_THRESHOLD:
+                        logger.info(f"Spread change: {token_id[:16]}... {spread_change:+.1%}")
+            
+            self.last_spreads[token_id] = spread
                 
         except Exception as e:
             logger.error(f"Error handling book update: {e}")
@@ -344,7 +468,7 @@ class WebSocketWorker:
     
     async def run(self):
         """Run the WebSocket worker"""
-        logger.info("Starting WebSocket Worker")
+        logger.info("Starting WebSocket Worker (Wolf Pack Edition)")
         
         # Run both connection and refresh tasks
         await asyncio.gather(
@@ -371,4 +495,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

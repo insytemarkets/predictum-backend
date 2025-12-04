@@ -141,7 +141,7 @@ class SupabaseClient:
             logger.error(f"Error inserting orderbook: {e}", exc_info=True)
             return None
     
-    def insert_price(self, market_id: str, outcome_index: int, price: float) -> Optional[Dict]:
+    def insert_price(self, market_id: str, outcome_index: int, price) -> Optional[Dict]:
         """Insert price data with timestamp"""
         try:
             market = self.client.table('markets').select('id').eq('condition_id', market_id).execute()
@@ -151,10 +151,24 @@ class SupabaseClient:
             
             market_uuid = market.data[0]['id']
             
+            # Handle price that might be a dict {buy, sell, mid}
+            price_value = price
+            if isinstance(price, dict):
+                if 'mid' in price:
+                    price_value = price['mid']
+                elif 'buy' in price and 'sell' in price:
+                    price_value = (float(price['buy']) + float(price['sell'])) / 2
+                elif 'buy' in price:
+                    price_value = price['buy']
+                elif 'sell' in price:
+                    price_value = price['sell']
+                else:
+                    price_value = 0.5
+            
             data = {
                 'market_id': market_uuid,
                 'outcome_index': outcome_index,
-                'price': float(price),
+                'price': float(price_value),
                 'timestamp': 'now()'
             }
             

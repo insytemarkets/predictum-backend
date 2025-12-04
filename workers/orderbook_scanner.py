@@ -74,11 +74,20 @@ class OrderBookScanner:
                 if tokens:
                     token_to_market[tokens[0]] = condition_id
             
+            # Log what we received for debugging
+            logger.info(f"Received {len(orderbooks)} orderbooks, type: {type(orderbooks)}")
+            if orderbooks:
+                sample_key = next(iter(orderbooks.keys()), None)
+                if sample_key:
+                    sample_val = orderbooks[sample_key]
+                    logger.info(f"Sample key: {sample_key[:20]}..., value type: {type(sample_val)}")
+            
             # Process batch results - orderbooks is a dict {token_id: orderbook_data}
             for token_id, orderbook in orderbooks.items():
                 try:
+                    # Skip if orderbook is not a dict (might be parsing error)
                     if not isinstance(orderbook, dict):
-                        logger.debug(f"Skipping non-dict orderbook for {token_id}")
+                        logger.warning(f"Orderbook for {token_id[:20]}... is {type(orderbook)}, skipping")
                         continue
                     
                     # Find the market for this token
@@ -93,6 +102,7 @@ class OrderBookScanner:
                                 break
                     
                     if not condition_id:
+                        logger.debug(f"No market found for token {token_id[:20]}...")
                         continue
                     
                     bids = orderbook.get('bids', [])

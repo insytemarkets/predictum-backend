@@ -144,3 +144,7 @@ ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS whale_address TEXT;
 ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS volume_velocity NUMERIC;
 ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
 
+
+
+
+

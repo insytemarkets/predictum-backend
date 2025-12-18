@@ -1,22 +1,17 @@
-# Node
-node_modules/
-dist/
-build/
-.env
-.env.local
-.DS_Store
-
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
-venv/
-.venv/
+*.so
+.Python
 env/
-*.egg-info/
-.coverage
-
-# IDE
-.vscode/
+venv/
+ENV/
+.venv
+.env
+*.log
+.DS_Store
 .idea/
-
+.vscode/
+*.egg-info/
+dist/
+build/
